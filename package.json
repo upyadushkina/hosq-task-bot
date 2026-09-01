@@ -1,0 +1,21 @@
+{
+  "name": "hosq-task-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "check": "tsc --noEmit",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.6.14",
+    "jose": "^5.9.6"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250413.0",
+    "typescript": "^5.6.3",
+    "wrangler": "^3.99.0"
+  }
+}

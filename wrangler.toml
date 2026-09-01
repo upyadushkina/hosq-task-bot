@@ -1,0 +1,26 @@
+name = "hosq-task-bot"
+main = "worker.js"
+compatibility_date = "2025-04-01"
+
+# Bind D1 in Cloudflare dashboard or uncomment and set database_id:
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "hosq-task-bot"
+# database_id = "YOUR_D1_DATABASE_ID"
+
+# Secrets (never commit): set via Dashboard or `wrangler secret put NAME`
+# TELEGRAM_BOT_TOKEN
+# TELEGRAM_WEBHOOK_SECRET   (optional)
+# NOTION_TOKEN              — Notion connection secret (Internal Integration Secret)
+# NOTION_TASKS_DB_ID        — Tasks database ID (32-char UUID with dashes)
+
+# Optional overrides if property names differ from hosq defaults:
+# NOTION_TASK_NAME_FORMAT=rich_text   (default; use "title" if Task name is a title field)
+# NOTION_PROP_TASK_NAME
+# NOTION_PROP_STATUS
+# NOTION_PROP_RESPONSIBLE
+# NOTION_PROP_CONSULT
+# NOTION_PROP_DEADLINE
+# NOTION_PROP_PRIORITY
+# NOTION_PROP_TASK_TYPE
+# NOTION_PROP_CONNECTED_PROJECTS
