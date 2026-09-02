@@ -14,65 +14,73 @@ const MessageTags = {
   onboardingIntro: "onboarding_intro",
   onboardingAskName: "onboarding_ask_name",
   onboardingAskEmail: "onboarding_ask_email",
-  onboardingAskLocation: "onboarding_ask_location",
   onboardingComplete: "onboarding_complete",
   menuMain: "menu_main",
   menuTasks: "menu_tasks",
-  menuProfile: "menu_profile",
   menuProjects: "menu_projects",
-  menuShop: "menu_shop",
   menuOnFire: "menu_on_fire",
-  menuTeam: "menu_team",
+  menuNewTask: "menu_new_task",
   menuBack: "menu_back",
-  profileCard: "profile_card",
+  menuNavMenu: "menu_nav_menu",
   projectsListHeader: "projects_list_header",
   projectsEmpty: "projects_empty",
-  shopListHeader: "shop_list_header",
-  shopInsufficientSparks: "shop_insufficient_sparks",
-  shopPurchaseSuccess: "shop_purchase_success",
-  shopSellSuccess: "shop_sell_success",
-
-  helperCard: "helper_card",
-  helperActionBuy: "helper_action_buy",
-  helperActionBack: "helper_action_back",
-
-  profileSettingsOpen: "profile_settings_open",
-  profileSettingsMenu: "profile_settings_menu",
-  profileSettingsChangeName: "profile_settings_change_name",
-  profileSettingsChangeLocation: "profile_settings_change_location",
-  profileSettingsChangeReminderTime: "profile_settings_change_reminder_time",
-  profileSetTask: "profile_set_task",
-  profileSettingsBack: "profile_settings_back",
-
-  settingsAskName: "settings_ask_name",
-  settingsAskLocation: "settings_ask_location",
-  settingsAskReminderTime: "settings_ask_reminder_time",
-  settingsSaved: "settings_saved",
-
   setTaskAskTitle: "settask_ask_title",
   setTaskAskDeadline: "settask_ask_deadline",
   setTaskAskPriority: "settask_ask_priority",
   setTaskAskProject: "settask_ask_project",
   setTaskNoProject: "settask_no_project",
   setTaskCreated: "settask_created",
-
   onFireHeader: "onfire_header",
   onFireEmpty: "onfire_empty",
-  teamHeader: "team_header",
-  teamEmpty: "team_empty",
-
-  teamMemberViewTasks: "team_member_view_tasks",
-  teamMemberViewProjects: "team_member_view_projects",
-  teamMemberBack: "team_member_back",
-
+  onFireOverdueHeader: "onfire_overdue_header",
+  onFireTodayHeader: "onfire_today_header",
+  onFireTomorrowHeader: "onfire_tomorrow_header",
+  onFireThisWeekHeader: "onfire_this_week_header",
   tasksListHeader: "tasks_list_header",
   tasksEmpty: "tasks_empty",
   taskCardTemplate: "task_card_template",
   taskActionComplete: "task_action_complete",
-  taskActionReschedule: "task_action_reschedule",
-  taskAskRescheduleDate: "task_ask_reschedule_date",
-  taskRescheduleOk: "task_reschedule_ok",
+  taskActionOpenNotion: "task_action_open_notion",
+  taskDoneSuccess: "task_done_success",
   taskNotFound: "task_not_found",
+};
+
+/** Built-in copy — used when D1 messages row is missing (run d1/console/19_seed_ui_v2.sql to override). */
+const DEFAULT_MESSAGES = {
+  onboarding_intro: "hey, welcome to the hosq task bot ✦ let's set you up",
+  onboarding_ask_name: "what's your name?",
+  onboarding_ask_email:
+    "and what is your email (the one connected to Notion)? this is how i'll find your tasks",
+  onboarding_complete: "found you ✦ you're all set\nlet's see what's going on",
+  menu_main: "↓",
+  menu_on_fire: "on fire 🔥",
+  menu_tasks: "my tasks",
+  menu_projects: "my projects",
+  menu_new_task: "new task",
+  menu_back: "← back",
+  menu_nav_menu: "← menu",
+  onfire_header: "tasks with deadline this week 🔥",
+  onfire_overdue_header: "you've missed the deadline:",
+  onfire_today_header: "today",
+  onfire_tomorrow_header: "tomorrow",
+  onfire_this_week_header: "later this week",
+  onfire_empty: "nothing's on fire — enjoy this rare moment 🙂",
+  tasks_list_header: "everything currently on your plate ↓",
+  tasks_empty: "nothing here, suspiciously peaceful 👀",
+  projects_list_header: "your projects ↓",
+  projects_empty: "no projects found",
+  task_card_template:
+    "<b>{title}</b>\n\ndue {deadline}\n\nproject · {project}\npriority · {priority}\nstatus · {status}\nconsult · {consult_name} {consult_username}\n\n{categories}\n\n{description}",
+  task_action_complete: "✓ Done",
+  task_action_open_notion: "✦ Open in Notion",
+  task_done_success: "✦ marked as done, nice job",
+  task_not_found: "task not found",
+  settask_ask_title: "what's the task?",
+  settask_ask_deadline: "deadline? (YYYY-MM-DD)",
+  settask_ask_priority: "pick priority:",
+  settask_ask_project: "link to a project?",
+  settask_no_project: "no project",
+  settask_created: "task created ✦",
 };
 
 function normalizeKey(s) {
@@ -113,11 +121,84 @@ async function getMessage(db, tag) {
 }
 
 async function formatMessage(db, tag, vars = {}) {
-  const t = await getMessage(db, tag);
+  const key = normalizeKey(tag);
+  const t = (await getMessage(db, tag)) || DEFAULT_MESSAGES[key];
   if (t) return formatTemplate(t, vars);
   const fallback = await getMessage(db, MessageTags.systemMessageMissing);
   if (fallback) return formatTemplate(fallback, { ...vars, tag });
   return `[missing message: ${tag}]`;
+}
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function notionPageUrl(pageId) {
+  const id = String(pageId || "").replace(/-/g, "");
+  return id ? `https://www.notion.so/${id}` : "https://www.notion.so";
+}
+
+function formatDeadlineShort(deadlineYmd, todayYmd) {
+  if (!deadlineYmd) return "";
+  const parsed = parseLooseDeadlineToYmd(deadlineYmd, todayYmd || deadlineYmd);
+  if (!parsed) return String(deadlineYmd);
+  const [y, m, d] = parsed.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: "UTC" }).format(dt);
+}
+
+function taskGalleryLabel(page, env, todayYmd) {
+  const title = taskTitleFromPage(page);
+  const raw = deadlineFromProps((page && page.properties) || {}, env);
+  const ymd = parseLooseDeadlineToYmd(raw, todayYmd);
+  const due = ymd ? formatDeadlineShort(ymd, todayYmd) : "";
+  const label = due ? `${title} | due ${due}` : title;
+  return label.slice(0, 60);
+}
+
+function endOfWeekYmd(todayYmd) {
+  const [y, m, d] = todayYmd.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  const dow = dt.getUTCDay();
+  const daysUntilSunday = dow === 0 ? 0 : 7 - dow;
+  return addDaysYmd(todayYmd, daysUntilSunday);
+}
+
+async function listNavKeyboard(db, backCallback = "menu:back") {
+  const back = await formatMessage(db, MessageTags.menuBack, {});
+  const menu = await formatMessage(db, MessageTags.menuNavMenu, {});
+  return {
+    inline_keyboard: [
+      [
+        { text: back, callback_data: backCallback },
+        { text: menu, callback_data: "menu:back" },
+      ],
+    ],
+  };
+}
+
+async function sendTelegramMessage(env, { chat_id, text, reply_markup, parse_mode }) {
+  const payload = { chat_id, text: String(text || " ") };
+  if (reply_markup) payload.reply_markup = reply_markup;
+  if (parse_mode) payload.parse_mode = parse_mode;
+  await telegramApi(env, "sendMessage", payload);
+}
+
+async function setTaskListBack(db, telegramUserId, backCallback) {
+  await db
+    .prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
+    .bind(`task_list_back_${telegramUserId}`, String(backCallback))
+    .run();
+}
+
+async function getTaskListBack(db, telegramUserId) {
+  const row = await dbGet(db, "SELECT parameter_value FROM parameters WHERE parameter_key=? LIMIT 1", [
+    `task_list_back_${telegramUserId}`,
+  ]);
+  return row ? row.parameter_value : "menu:tasks";
 }
 
 async function getParameter(db, key) {
@@ -512,24 +593,24 @@ function getCommandLikeText(message) {
 }
 
 async function mainMenuKeyboard(db) {
-  const tTasks = await formatMessage(db, MessageTags.menuTasks, {});
-  const tProfile = await formatMessage(db, MessageTags.menuProfile, {});
-  const tProjects = await formatMessage(db, MessageTags.menuProjects, {});
-  const tShop = await formatMessage(db, MessageTags.menuShop, {});
   const tOnFire = await formatMessage(db, MessageTags.menuOnFire, {});
-  const tTeam = await formatMessage(db, MessageTags.menuTeam, {});
+  const tTasks = await formatMessage(db, MessageTags.menuTasks, {});
+  const tProjects = await formatMessage(db, MessageTags.menuProjects, {});
+  const tNewTask = await formatMessage(db, MessageTags.menuNewTask, {});
   return {
     inline_keyboard: [
+      [{ text: tOnFire, callback_data: "menu:onfire" }],
       [{ text: tTasks, callback_data: "menu:tasks" }],
-      [
-        { text: tOnFire, callback_data: "menu:onfire" },
-        { text: tTeam, callback_data: "menu:team" },
-      ],
-      [{ text: tProfile, callback_data: "menu:profile" }],
       [{ text: tProjects, callback_data: "menu:projects" }],
-      [{ text: tShop, callback_data: "menu:shop" }],
+      [{ text: tNewTask, callback_data: "menu:newtask" }],
     ],
   };
+}
+
+async function finishOnboarding(env, db, chatId, from, profile) {
+  await ensureNotionUserIdForEmail(env, db, profile);
+  const done = await formatMessage(db, MessageTags.onboardingComplete, { name: profile.user_name });
+  await sendTelegramMessage(env, { chat_id: chatId, text: done, reply_markup: await mainMenuKeyboard(db) });
 }
 
 function requireEnv(env, key) {
@@ -957,6 +1038,10 @@ async function showProjectTasks(env, db, chatId, from, projectId) {
   const p = await getProfileByTelegramUserId(db, from.id);
   if (!p) return handleStart(env, db, chatId, from);
   await ensureNotionUserIdForEmail(env, db, p);
+  await setTaskListBack(db, from.id, "menu:projects");
+
+  const tz = p.timezone || (await getParameter(db, "default_timezone")) || "UTC";
+  const today = ymdFromDateInTimeZone(new Date(), tz);
 
   const project = await dbGet(db, "SELECT project_name FROM projects WHERE project_tag=? LIMIT 1", [String(projectId)]);
   const projectName = project ? project.project_name : String(projectId);
@@ -966,13 +1051,13 @@ async function showProjectTasks(env, db, chatId, from, projectId) {
     tasks = await collectActiveNotionTasksForProfile(env, p, 400);
   } catch (e) {
     console.error("showProjectTasks notion error:", e);
-    await telegramApi(env, "sendMessage", { chat_id: chatId, text: String(e), reply_markup: await mainMenuKeyboard(db) });
+    await sendTelegramMessage(env, { chat_id: chatId, text: String(e), reply_markup: await mainMenuKeyboard(db) });
     return;
   }
 
   const related = tasks.filter((t) => connectedProjectRelationIdsFromTask(t).includes(String(projectId)));
   if (!related.length) {
-    await telegramApi(env, "sendMessage", {
+    await sendTelegramMessage(env, {
       chat_id: chatId,
       text: `${projectName}\n\nNo tasks in this project.`,
       reply_markup: {
@@ -982,18 +1067,16 @@ async function showProjectTasks(env, db, chatId, from, projectId) {
     return;
   }
 
+  const nav = await listNavKeyboard(db, "menu:projects");
   const keyboard = {
     inline_keyboard: [
-      ...related.map((page) => {
-        const title = taskTitleFromPage(page);
-        const deadline = deadlineFromProps(page.properties || {}, env);
-        const label = deadline ? `${title} — ${deadline}` : title;
-        return [{ text: label.slice(0, 60), callback_data: `task:open:${page.id}` }];
-      }),
-      [{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "menu:projects" }],
+      ...related.map((page) => [
+        { text: taskGalleryLabel(page, env, today), callback_data: `task:open:${page.id}` },
+      ]),
+      ...nav.inline_keyboard,
     ],
   };
-  await telegramApi(env, "sendMessage", { chat_id: chatId, text: projectName, reply_markup: keyboard });
+  await sendTelegramMessage(env, { chat_id: chatId, text: projectName, reply_markup: keyboard });
 }
 
 async function notionQueryDatabase(env, body) {
@@ -1108,60 +1191,30 @@ async function handleOnboardingText(env, db, chatId, from, text) {
       .bind(stateKey, JSON.stringify(state))
       .run();
 
-    // If email already exists, link this Telegram account to that profile (no duplicates).
     const existingByEmail = await getProfileByEmail(db, state.user_email);
+    let profile;
     if (existingByEmail) {
-      await upsertProfile(db, {
+      profile = await upsertProfile(db, {
         ...existingByEmail,
         telegram_user_id: String(from.id),
         telegram_username: from.username ? String(from.username) : existingByEmail.telegram_username,
       });
-      await env.DB.prepare("DELETE FROM parameters WHERE parameter_key IN (?,?)")
-        .bind(stepKey, stateKey)
-        .run();
-      await telegramApi(env, "sendMessage", {
-        chat_id: chatId,
-        text: "You logged in.",
-        reply_markup: await mainMenuKeyboard(db),
+    } else {
+      profile = await upsertProfile(db, {
+        user_name: state.user_name || "Unknown",
+        user_email: state.user_email || "",
+        telegram_user_id: String(from.id),
+        telegram_username: from.username ? String(from.username) : null,
+        timezone: "UTC",
+        reminder_time: "09:00",
       });
-      return true;
     }
-
-    await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
-      .bind(stepKey, "location")
-      .run();
-    const askLoc = await formatMessage(db, MessageTags.onboardingAskLocation, {});
-    await telegramApi(env, "sendMessage", { chat_id: chatId, text: askLoc });
-    return true;
-  }
-
-  if (step === "location") {
-    // Accept either location text or timezone. Store as timezone if it looks like Area/City.
-    const loc = text.trim();
-    const tzLike = /^[A-Za-z_]+\/[A-Za-z_]+/.test(loc) ? loc : null;
-    const tz = tzLike || (await getParameter(db, "default_timezone")) || "UTC";
-    const rt = (await getParameter(db, "default_reminder_time")) || "09:00";
-    const reminder = parseTimeHHmm(rt) || "09:00";
-
-    const profile = await upsertProfile(db, {
-      user_name: state.user_name || "Unknown",
-      user_email: state.user_email || "",
-      telegram_user_id: String(from.id),
-      telegram_username: from.username ? String(from.username) : null,
-      timezone: tz,
-      reminder_time: reminder,
-    });
 
     await env.DB.prepare("DELETE FROM parameters WHERE parameter_key IN (?,?)")
       .bind(stepKey, stateKey)
       .run();
 
-    const done = await formatMessage(db, MessageTags.onboardingComplete, { name: profile.user_name });
-    await telegramApi(env, "sendMessage", {
-      chat_id: chatId,
-      text: done,
-      reply_markup: await mainMenuKeyboard(db),
-    });
+    await finishOnboarding(env, db, chatId, from, profile);
     return true;
   }
 
@@ -1246,47 +1299,80 @@ async function showOnFire(env, db, chatId, from) {
   const p = await getProfileByTelegramUserId(db, from.id);
   if (!p) return handleStart(env, db, chatId, from);
   await ensureNotionUserIdForEmail(env, db, p);
+  await setTaskListBack(db, from.id, "menu:onfire");
 
   const tz = p.timezone || (await getParameter(db, "default_timezone")) || "UTC";
   const today = ymdFromDateInTimeZone(new Date(), tz);
   const tomorrow = addDaysYmd(today, 1);
-  const dayAfter = addDaysYmd(today, 2);
+  const weekEnd = endOfWeekYmd(today);
 
   let tasks = [];
   try {
     tasks = await collectActiveNotionTasksForProfile(env, p, 200);
   } catch (e) {
     console.error("showOnFire notion error:", e);
-    await telegramApi(env, "sendMessage", { chat_id: chatId, text: String(e), reply_markup: await mainMenuKeyboard(db) });
+    await sendTelegramMessage(env, {
+      chat_id: chatId,
+      text: String(e),
+      reply_markup: await mainMenuKeyboard(db),
+    });
     return;
   }
 
-  const withDeadline = tasks
-    .map((t) => ({ t, d: parseLooseDeadlineToYmd(deadlineFromProps((t && t.properties) || {}, env), today) }))
-    .filter((x) => Boolean(x.d));
+  const onFire = tasks
+    .map((t) => ({
+      t,
+      d: parseLooseDeadlineToYmd(deadlineFromProps((t && t.properties) || {}, env), today),
+    }))
+    .filter((x) => x.d && x.d <= weekEnd);
 
-  withDeadline.sort((a, b) => String(a.d).localeCompare(String(b.d)));
-  const urgent = withDeadline.slice(0, 5).map((x) => x.t);
-
-  if (!urgent.length) {
+  if (!onFire.length) {
     const t = await formatMessage(db, MessageTags.onFireEmpty, {});
-    await telegramApi(env, "sendMessage", { chat_id: chatId, text: t, reply_markup: await mainMenuKeyboard(db) });
+    await sendTelegramMessage(env, { chat_id: chatId, text: t, reply_markup: await mainMenuKeyboard(db) });
     return;
+  }
+
+  onFire.sort((a, b) => String(a.d).localeCompare(String(b.d)));
+
+  const groups = {
+    overdue: [],
+    today: [],
+    tomorrow: [],
+    thisWeek: [],
+  };
+  for (const item of onFire) {
+    if (item.d < today) groups.overdue.push(item);
+    else if (item.d === today) groups.today.push(item);
+    else if (item.d === tomorrow) groups.tomorrow.push(item);
+    else groups.thisWeek.push(item);
   }
 
   const header = await formatMessage(db, MessageTags.onFireHeader, {});
+  const lines = [header];
+  if (groups.overdue.length) {
+    lines.push("", await formatMessage(db, MessageTags.onFireOverdueHeader, {}));
+  }
+  if (groups.today.length) {
+    lines.push("", await formatMessage(db, MessageTags.onFireTodayHeader, {}));
+  }
+  if (groups.tomorrow.length) {
+    lines.push("", await formatMessage(db, MessageTags.onFireTomorrowHeader, {}));
+  }
+  if (groups.thisWeek.length) {
+    lines.push("", await formatMessage(db, MessageTags.onFireThisWeekHeader, {}));
+  }
+
+  const ordered = [...groups.overdue, ...groups.today, ...groups.tomorrow, ...groups.thisWeek];
+  const nav = await listNavKeyboard(db, "menu:back");
   const keyboard = {
     inline_keyboard: [
-      ...urgent.map((page) => {
-        const title = taskTitleFromPage(page);
-        const deadline = deadlineFromProps(page.properties || {}, env);
-        const label = deadline ? `${title} — ${deadline}` : title;
-        return [{ text: label.slice(0, 60), callback_data: `task:open:${page.id}` }];
-      }),
-      [{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "menu:back" }],
+      ...ordered.map(({ t }) => [
+        { text: taskGalleryLabel(t, env, today), callback_data: `task:open:${t.id}` },
+      ]),
+      ...nav.inline_keyboard,
     ],
   };
-  await telegramApi(env, "sendMessage", { chat_id: chatId, text: header, reply_markup: keyboard });
+  await sendTelegramMessage(env, { chat_id: chatId, text: lines.join("\n"), reply_markup: keyboard });
 }
 
 async function showTeam(env, db, chatId, from) {
@@ -1361,17 +1447,18 @@ async function showProjects(env, db, chatId, from) {
   );
   if (!projects.length) {
     const t = await formatMessage(db, MessageTags.projectsEmpty, { email: p.user_email });
-    await telegramApi(env, "sendMessage", { chat_id: chatId, text: t, reply_markup: await mainMenuKeyboard(db) });
+    await sendTelegramMessage(env, { chat_id: chatId, text: t, reply_markup: await mainMenuKeyboard(db) });
     return;
   }
   const header = await formatMessage(db, MessageTags.projectsListHeader, {});
-  await telegramApi(env, "sendMessage", {
+  const nav = await listNavKeyboard(db, "menu:back");
+  await sendTelegramMessage(env, {
     chat_id: chatId,
     text: header,
     reply_markup: {
       inline_keyboard: [
         ...projects.map((x) => [{ text: x.project_name, callback_data: `project:open:${x.project_tag}` }]),
-        [{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "menu:back" }],
+        ...nav.inline_keyboard,
       ],
     },
   });
@@ -1381,12 +1468,17 @@ async function showTasks(env, db, chatId, from) {
   const p = await getProfileByTelegramUserId(db, from.id);
   if (!p) return handleStart(env, db, chatId, from);
   await ensureNotionUserIdForEmail(env, db, p);
+  await setTaskListBack(db, from.id, "menu:tasks");
+
+  const tz = p.timezone || (await getParameter(db, "default_timezone")) || "UTC";
+  const today = ymdFromDateInTimeZone(new Date(), tz);
+
   let tasks = [];
   try {
     tasks = await notionQueryAllTasksForUser(env, p);
   } catch (e) {
     console.error("showTasks notion error:", e);
-    await telegramApi(env, "sendMessage", {
+    await sendTelegramMessage(env, {
       chat_id: chatId,
       text:
         "Could not load tasks from Notion. Common causes:\n" +
@@ -1401,60 +1493,79 @@ async function showTasks(env, db, chatId, from) {
   }
   if (!tasks.length) {
     const t = await formatMessage(db, MessageTags.tasksEmpty, {});
-    await telegramApi(env, "sendMessage", { chat_id: chatId, text: t, reply_markup: await mainMenuKeyboard(db) });
+    await sendTelegramMessage(env, { chat_id: chatId, text: t, reply_markup: await mainMenuKeyboard(db) });
     return;
   }
+
+  tasks.sort((a, b) => {
+    const da = parseLooseDeadlineToYmd(deadlineFromProps(a.properties || {}, env), today) || "9999-99-99";
+    const db_ = parseLooseDeadlineToYmd(deadlineFromProps(b.properties || {}, env), today) || "9999-99-99";
+    return String(da).localeCompare(String(db_));
+  });
+
   const header = await formatMessage(db, MessageTags.tasksListHeader, {});
   const sliced = tasks.slice(0, 50);
+  const nav = await listNavKeyboard(db, "menu:back");
   const keyboard = {
     inline_keyboard: [
-      ...sliced.map((page) => {
-        const title = taskTitleFromPage(page);
-        const deadline = deadlineFromProps(page.properties || {}, env);
-        const label = deadline ? `${title} — ${deadline}` : title;
-        return [{ text: label.slice(0, 60), callback_data: `task:open:${page.id}` }];
-      }),
-      [{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "menu:back" }],
+      ...sliced.map((page) => [
+        { text: taskGalleryLabel(page, env, today), callback_data: `task:open:${page.id}` },
+      ]),
+      ...nav.inline_keyboard,
     ],
   };
-  await telegramApi(env, "sendMessage", {
-    chat_id: chatId,
-    text: tasks.length > sliced.length ? `${header}\n\nShowing ${sliced.length}/${tasks.length}` : header,
-    reply_markup: keyboard,
-  });
+  const suffix = tasks.length > sliced.length ? `\n\nShowing ${sliced.length}/${tasks.length}` : "";
+  await sendTelegramMessage(env, { chat_id: chatId, text: header + suffix, reply_markup: keyboard });
+}
+
+async function consultDisplayFromProps(db, props, env, todayYmd) {
+  const consultName = env ? getConfiguredConsultPropName(env) : "Consult";
+  const prop = pickFirstPropByNames(props, [consultName, "Consult", "consult"]);
+  const person = peopleFirst(prop || {});
+  const name = person && person.name ? person.name : textValue(prop || {});
+  let username = "";
+  if (person && person.person && person.person.email) {
+    const prof = await getProfileByEmail(db, person.person.email);
+    if (prof && prof.telegram_username) {
+      username = `@${String(prof.telegram_username).replace(/^@/, "")}`;
+    }
+  }
+  return { name: name || "—", username: username || "" };
 }
 
 async function renderTaskCard(env, db, page) {
   const props = page.properties || {};
-  const title = taskTitleFromPage(page);
-  const deadline = deadlineFromProps(props, env);
-  const status = statusFromProps(props, env);
-  const priority = priorityFromProps(props, env);
-  const level = levelFromPriorityName(priority);
-  const reward = level;
+  const tz = "UTC";
+  const today = ymdFromDateInTimeZone(new Date(), tz);
+  const title = escapeHtml(taskTitleFromPage(page));
+  const rawDeadline = deadlineFromProps(props, env);
+  const deadlineYmd = parseLooseDeadlineToYmd(rawDeadline, today);
+  const deadline = deadlineYmd ? formatDeadlineShort(deadlineYmd, today) : escapeHtml(rawDeadline || "—");
+  const status = escapeHtml(statusFromProps(props, env) || "—");
+  const priority = escapeHtml(priorityFromProps(props, env) || "—");
   const categories = taskTypesFromProps(props, env);
-  const description = firstTextFromRichText(props.Description || {}) || "";
+  const categoryLine = categories.length
+    ? categories.map((c) => `#${c.replace(/\s+/g, "")}`).join(" ")
+    : "";
+  const description = escapeHtml(firstTextFromRichText(props.Description || {}) || "");
 
   const projects = await projectNamesFromProps(env, props, 3);
+  const project = escapeHtml(projects.join(", ") || "—");
 
-  const consult = consultFromProps(props, env);
-  const consultName = consult && consult.name ? consult.name : "";
-  const consultTg = "";
+  const consult = await consultDisplayFromProps(db, props, env, today);
 
   const template = await formatMessage(db, MessageTags.taskCardTemplate, {});
-  const text = formatTemplate(template, {
+  return formatTemplate(template, {
     title,
     deadline,
-    reward,
-    project: projects.join(", "),
+    project,
     priority,
     status,
-    categories: categories.map((c) => `#${c.replace(/\s+/g, "")}`).join(" "),
+    categories: categoryLine,
     description,
-    consult_name: consultName,
-    consult_telegram: consultTg ? `@${consultTg.replace(/^@/, "")}` : "",
+    consult_name: escapeHtml(consult.name),
+    consult_username: consult.username ? escapeHtml(consult.username) : "",
   });
-  return text;
 }
 
 async function openTaskReadonly(env, db, chatId, pageId, backCb) {
@@ -1595,22 +1706,22 @@ async function openTask(env, db, chatId, from, pageId) {
   const page = await notionGetTask(env, pageId);
   if (!page) {
     const t = await formatMessage(db, MessageTags.taskNotFound, {});
-    await telegramApi(env, "sendMessage", { chat_id: chatId, text: t, reply_markup: await mainMenuKeyboard(db) });
+    await sendTelegramMessage(env, { chat_id: chatId, text: t, reply_markup: await mainMenuKeyboard(db) });
     return;
   }
   const text = await renderTaskCard(env, db, page);
   const btnComplete = await formatMessage(db, MessageTags.taskActionComplete, {});
-  const btnReschedule = await formatMessage(db, MessageTags.taskActionReschedule, {});
+  const btnNotion = await formatMessage(db, MessageTags.taskActionOpenNotion, {});
+  const btnBack = await formatMessage(db, MessageTags.menuBack, {});
+  const listBack = await getTaskListBack(db, from.id);
   const keyboard = {
     inline_keyboard: [
-      [
-        { text: btnComplete, callback_data: `task:done:${pageId}` },
-        { text: btnReschedule, callback_data: `task:resched:${pageId}` },
-      ],
-      [{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "menu:tasks" }],
+      [{ text: btnComplete, callback_data: `task:done:${pageId}` }],
+      [{ text: btnNotion, url: notionPageUrl(pageId) }],
+      [{ text: btnBack, callback_data: listBack }],
     ],
   };
-  await telegramApi(env, "sendMessage", { chat_id: chatId, text, reply_markup: keyboard });
+  await sendTelegramMessage(env, { chat_id: chatId, text, reply_markup: keyboard, parse_mode: "HTML" });
 }
 
 async function completeTask(env, db, chatId, from, pageId) {
@@ -1619,36 +1730,32 @@ async function completeTask(env, db, chatId, from, pageId) {
   const page = await notionGetTask(env, pageId);
   if (!page) return;
   const props = page.properties || {};
-  const priority = priorityFromProps(props, env);
-  const level = levelFromPriorityName(priority);
   const before = normalizeKey(statusFromProps(props, env));
   const alreadyDone = before === normalizeKey("Done");
   const statusKey = getConfiguredStatusPropName(env);
   const statusProp = props[statusKey] || props.Status;
   const statusType = statusProp && statusProp.type ? statusProp.type : null;
-  if (statusType === "status") {
-    await notionUpdateTask(env, pageId, { [statusKey]: { status: { name: "Done" } } });
-  } else if (statusType === "select") {
-    await notionUpdateTask(env, pageId, { [statusKey]: { select: { name: "Done" } } });
-  } else {
-    throw new Error(`Unsupported Notion Status field type: ${statusType || "unknown"}`);
-  }
-
   if (!alreadyDone) {
-    const newBalance = Number(p.sparks || 0) + Number(level);
-    await env.DB.batch([
-      env.DB.prepare("UPDATE profiles SET sparks=?, completed_tasks=completed_tasks+1 WHERE user_email=?").bind(
-        newBalance,
-        p.user_email,
-      ),
-      env.DB.prepare(
-        "INSERT INTO sparks_ledger(event_at, user_email, delta, balance_after, reason, notion_page_id) VALUES(?,?,?,?,?,?)",
-      ).bind(new Date().toISOString(), p.user_email, Number(level), newBalance, "task_done", pageId),
-    ]);
+    if (statusType === "status") {
+      await notionUpdateTask(env, pageId, { [statusKey]: { status: { name: "Done" } } });
+    } else if (statusType === "select") {
+      await notionUpdateTask(env, pageId, { [statusKey]: { select: { name: "Done" } } });
+    } else {
+      throw new Error(`Unsupported Notion Status field type: ${statusType || "unknown"}`);
+    }
+    await env.DB.prepare("UPDATE profiles SET completed_tasks=completed_tasks+1 WHERE user_email=?").bind(p.user_email).run();
   }
 
-  // Re-open card
-  await openTask(env, db, chatId, from, pageId);
+  const ok = await formatMessage(db, MessageTags.taskDoneSuccess, {});
+  const listBack = await getTaskListBack(db, from.id);
+  const btnBack = await formatMessage(db, MessageTags.menuBack, {});
+  await sendTelegramMessage(env, {
+    chat_id: chatId,
+    text: ok,
+    reply_markup: {
+      inline_keyboard: [[{ text: btnBack, callback_data: listBack }]],
+    },
+  });
 }
 
 async function startReschedule(env, db, chatId, from, pageId) {
@@ -1681,7 +1788,7 @@ async function setTaskPriorityKeyboard(db) {
   return {
     inline_keyboard: [
       ...opts.map((name) => [{ text: name, callback_data: `settask:priority:${name}` }]),
-      [{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "profile:settings" }],
+      [{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "menu:back" }],
     ],
   };
 }
@@ -1697,7 +1804,7 @@ async function setTaskProjectKeyboard(env, db, profile) {
     inline_keyboard: [
       ...rows.map((r) => [{ text: r.project_name, callback_data: `settask:project:${r.project_tag}` }]),
       [{ text: noProjText, callback_data: "settask:project:none" }],
-      [{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "profile:settings" }],
+      [{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "menu:back" }],
     ],
   };
 }
@@ -1938,13 +2045,10 @@ export default {
             return new Response("ok");
           }
           const handled = await handleOnboardingText(env, db, chatId, from, text);
-          const handledSettings = handled ? false : await handleSettingsText(env, db, chatId, from, text);
-          const handledSetTask = handled || handledSettings ? false : await handleSetTaskText(env, db, chatId, from, text);
-          const handledReschedule =
-            handled || handledSettings || handledSetTask ? false : await handleRescheduleText(env, db, chatId, from, text);
-          if (!handled && !handledSettings && !handledSetTask && !handledReschedule) {
+          const handledSetTask = handled ? false : await handleSetTaskText(env, db, chatId, from, text);
+          if (!handled && !handledSetTask) {
             const menu = await formatMessage(db, MessageTags.menuMain, {});
-            await telegramApi(env, "sendMessage", {
+            await sendTelegramMessage(env, {
               chat_id: chatId,
               text: menu,
               reply_markup: await mainMenuKeyboard(db),
@@ -1974,58 +2078,17 @@ export default {
           try {
             if (data === "menu:tasks") await showTasks(env, db, chatId, from);
             else if (data === "menu:onfire") await showOnFire(env, db, chatId, from);
-            else if (data === "menu:team") await showTeam(env, db, chatId, from);
-            else if (data === "menu:profile") await showProfile(env, db, chatId, from);
             else if (data === "menu:projects") await showProjects(env, db, chatId, from);
-            else if (data === "menu:shop") await showShop(env, db, chatId, from);
-            else if (data === "profile:settings") await showProfileSettings(env, db, chatId);
-            else if (data === "profile:settask") await startSetTaskFlow(env, db, chatId, from);
-            else if (data === "profile:main") await showProfile(env, db, chatId, from);
-            else if (data === "settings:name") {
-              const ask = await formatMessage(db, MessageTags.settingsAskName, {});
-              await telegramApi(env, "sendMessage", { chat_id: chatId, text: ask });
-              await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
-                .bind(`settings_step_${from.id}`, "name")
-                .run();
-            } else if (data === "settings:location") {
-              const ask = await formatMessage(db, MessageTags.settingsAskLocation, {});
-              await telegramApi(env, "sendMessage", { chat_id: chatId, text: ask });
-              await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
-                .bind(`settings_step_${from.id}`, "location")
-                .run();
-            } else if (data === "settings:reminder") {
-              const ask = await formatMessage(db, MessageTags.settingsAskReminderTime, {});
-              await telegramApi(env, "sendMessage", { chat_id: chatId, text: ask });
-              await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
-                .bind(`settings_step_${from.id}`, "reminder")
-                .run();
-            } else if (data === "menu:back") {
+            else if (data === "menu:newtask") await startSetTaskFlow(env, db, chatId, from);
+            else if (data === "menu:back") {
               const menu = await formatMessage(db, MessageTags.menuMain, {});
-              await telegramApi(env, "sendMessage", { chat_id: chatId, text: menu, reply_markup: await mainMenuKeyboard(db) });
-            } else if (data.startsWith("shop:view:")) {
-              await showHelper(env, db, chatId, from, data.slice("shop:view:".length));
+              await sendTelegramMessage(env, {
+                chat_id: chatId,
+                text: menu,
+                reply_markup: await mainMenuKeyboard(db),
+              });
             } else if (data.startsWith("project:open:")) {
               await showProjectTasks(env, db, chatId, from, data.slice("project:open:".length));
-            } else if (data.startsWith("team:tasks:")) {
-              await showTeamMemberTasks(env, db, chatId, from, data.slice("team:tasks:".length));
-            } else if (data.startsWith("team:projects:")) {
-              await showTeamMemberProjects(env, db, chatId, from, data.slice("team:projects:".length));
-            } else if (data.startsWith("team:project:")) {
-              const rest = data.slice("team:project:".length);
-              const idx = rest.indexOf(":");
-              if (idx > 0) {
-                const who = rest.slice(0, idx);
-                const proj = rest.slice(idx + 1);
-                await showTeamMemberProjectTasks(env, db, chatId, from, who, proj);
-              }
-            } else if (data.startsWith("teamtask:open:")) {
-              const rest = data.slice("teamtask:open:".length);
-              const idx = rest.lastIndexOf(":");
-              if (idx > 0) {
-                const pageId = rest.slice(0, idx);
-                const who = rest.slice(idx + 1);
-                await openTaskReadonly(env, db, chatId, pageId, `team:tasks:${who}`);
-              }
             } else if (data.startsWith("settask:priority:")) {
               const p = await getProfileByTelegramUserId(db, from.id);
               if (!p) return;
@@ -2097,19 +2160,11 @@ export default {
                 .bind(`settask_step_${from.id}`, stateKey)
                 .run();
               const ok = await formatMessage(db, MessageTags.setTaskCreated, {});
-              await telegramApi(env, "sendMessage", { chat_id: chatId, text: ok, reply_markup: await mainMenuKeyboard(db) });
-            } else if (data.startsWith("team:")) {
-              await showTeamMemberProfile(env, db, chatId, from, data.slice("team:".length));
-            } else if (data.startsWith("shop:buy:")) {
-              await buyHelper(env, db, chatId, from, data.slice("shop:buy:".length));
-            } else if (data.startsWith("shop:sell:")) {
-              await sellHelper(env, db, chatId, from, data.slice("shop:sell:".length));
+              await sendTelegramMessage(env, { chat_id: chatId, text: ok, reply_markup: await mainMenuKeyboard(db) });
             } else if (data.startsWith("task:open:")) {
               await openTask(env, db, chatId, from, data.slice("task:open:".length));
             } else if (data.startsWith("task:done:")) {
               await completeTask(env, db, chatId, from, data.slice("task:done:".length));
-            } else if (data.startsWith("task:resched:")) {
-              await startReschedule(env, db, chatId, from, data.slice("task:resched:".length));
             }
           } catch (e) {
             console.error("callback handler error:", e);
