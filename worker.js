@@ -94,6 +94,10 @@ function normalizeTemplateVarKey(raw) {
   return s.replace(/[^a-z0-9]+/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
 }
 
+function normalizeTemplateNewlines(s) {
+  return String(s || "").replace(/\\n/g, "\n");
+}
+
 function formatTemplate(template, vars) {
   return String(template || "").replace(/\{([^}]+)\}/g, (_, rawKey) => {
     const k = normalizeTemplateVarKey(rawKey);
@@ -117,7 +121,7 @@ async function getMessage(db, tag) {
     "SELECT message_text FROM messages WHERE lower(message_tag)=? LIMIT 1",
     [normalizeKey(tag)],
   );
-  return row ? row.message_text : null;
+  return row ? normalizeTemplateNewlines(row.message_text) : null;
 }
 
 async function formatMessage(db, tag, vars = {}) {
@@ -855,20 +859,49 @@ function taskTitleFromPage(page) {
 }
 
 function getNotionTaskNamePropertyFormat(env) {
-  const f = env.NOTION_TASK_NAME_FORMAT ? String(env.NOTION_TASK_NAME_FORMAT).toLowerCase() : "rich_text";
-  return f === "title" ? "title" : "rich_text";
+  const f = env.NOTION_TASK_NAME_FORMAT ? String(env.NOTION_TASK_NAME_FORMAT).toLowerCase() : "title";
+  return f === "rich_text" ? "rich_text" : "title";
 }
 
 function buildTaskNameNotionValue(env, title) {
   const content = String(title || "").slice(0, 2000);
-  if (getNotionTaskNamePropertyFormat(env) === "title") {
-    return { title: [{ type: "text", text: { content } }] };
+  if (getNotionTaskNamePropertyFormat(env) === "rich_text") {
+    return { rich_text: [{ type: "text", text: { content } }] };
   }
-  return { rich_text: [{ type: "text", text: { content } }] };
+  return { title: [{ type: "text", text: { content } }] };
 }
 
 function getConnectedProjectsPropertyName(env) {
   return notionPropName(env, "connected_projects", NotionTaskProps.connectedProjects);
+}
+
+async function notionGetDatabaseSchema(env) {
+  const dbId = requireEnv(env, "NOTION_TASKS_DB_ID");
+  return await notionFetch(env, `/databases/${dbId}`, { method: "GET" });
+}
+
+function findTitlePropertyKey(schemaProps, preferredName) {
+  const props = schemaProps || {};
+  if (preferredName && props[preferredName] && props[preferredName].type === "title") return preferredName;
+  for (const k of Object.keys(props)) {
+    if (props[k] && props[k].type === "title") return k;
+  }
+  return preferredName || NotionTaskProps.taskName;
+}
+
+function findPeoplePropertyKey(schemaProps, preferredNames) {
+  const props = schemaProps || {};
+  for (const name of preferredNames) {
+    if (name && props[name] && props[name].type === "people") return name;
+  }
+  for (const k of Object.keys(props)) {
+    if (props[k] && props[k].type === "people") return k;
+  }
+  return null;
+}
+
+function schemaHasProperty(schemaProps, name, type) {
+  return Boolean(name && schemaProps && schemaProps[name] && schemaProps[name].type === type);
 }
 
 async function buildCreateTaskProperties(env, db, profile, task) {
@@ -878,16 +911,44 @@ async function buildCreateTaskProperties(env, db, profile, task) {
       "Your work email does not match any Notion workspace member. Use the same email in the bot and in Notion.",
     );
   }
-  const taskNameKey = notionPropName(env, "task_name", NotionTaskProps.taskName);
+
+  const dbSchema = await notionGetDatabaseSchema(env);
+  const schemaProps = dbSchema.properties || {};
+
+  const taskNameKey = findTitlePropertyKey(schemaProps, notionPropName(env, "task_name", NotionTaskProps.taskName));
   const props = {
-    [taskNameKey]: buildTaskNameNotionValue(env, task.title),
-    [getConfiguredDeadlinePropName(env)]: { date: { start: task.deadline } },
-    [notionPropName(env, "priority", NotionTaskProps.priority)]: { select: { name: task.priority } },
-    [getConfiguredResponsiblePropName(env)]: { people: [{ id: String(profile.notion_user_id) }] },
+    [taskNameKey]: { title: [{ type: "text", text: { content: String(task.title || "").slice(0, 2000) } }] },
   };
-  if (task.project_id) {
-    props[getConnectedProjectsPropertyName(env)] = { relation: [{ id: String(task.project_id) }] };
+
+  const deadlineKey = getConfiguredDeadlinePropName(env);
+  if (schemaHasProperty(schemaProps, deadlineKey, "date")) {
+    props[deadlineKey] = { date: { start: task.deadline } };
   }
+
+  const priorityKey = notionPropName(env, "priority", NotionTaskProps.priority);
+  if (schemaHasProperty(schemaProps, priorityKey, "select")) {
+    props[priorityKey] = { select: { name: task.priority } };
+  }
+
+  const responsibleKey = findPeoplePropertyKey(schemaProps, [
+    getConfiguredResponsiblePropName(env),
+    NotionTaskProps.responsible,
+    "Responsible",
+    "Resposible",
+    "Assignee",
+    "Owner",
+  ]);
+  if (responsibleKey) {
+    props[responsibleKey] = { people: [{ id: String(profile.notion_user_id) }] };
+  }
+
+  if (task.project_id) {
+    const projectsKey = getConnectedProjectsPropertyName(env);
+    if (schemaHasProperty(schemaProps, projectsKey, "relation")) {
+      props[projectsKey] = { relation: [{ id: String(task.project_id) }] };
+    }
+  }
+
   return props;
 }
 
@@ -1554,8 +1615,7 @@ async function renderTaskCard(env, db, page) {
 
   const consult = await consultDisplayFromProps(db, props, env, today);
 
-  const template = await formatMessage(db, MessageTags.taskCardTemplate, {});
-  return formatTemplate(template, {
+  return await formatMessage(db, MessageTags.taskCardTemplate, {
     title,
     deadline,
     project,
