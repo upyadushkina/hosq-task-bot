@@ -20,6 +20,14 @@ const MessageTags = {
   menuProjects: "menu_projects",
   menuOnFire: "menu_on_fire",
   menuNewTask: "menu_new_task",
+  menuSettings: "menu_settings",
+  settingsMenu: "settings_menu",
+  settingsChangeEmail: "settings_change_email",
+  settingsRestart: "settings_restart",
+  settingsAskEmail: "settings_ask_email",
+  settingsEmailSaved: "settings_email_saved",
+  settingsEmailInvalid: "settings_email_invalid",
+  settingsEmailTaken: "settings_email_taken",
   menuBack: "menu_back",
   menuNavMenu: "menu_nav_menu",
   projectsListHeader: "projects_list_header",
@@ -57,6 +65,14 @@ const DEFAULT_MESSAGES = {
   menu_tasks: "my tasks",
   menu_projects: "my projects",
   menu_new_task: "new task",
+  menu_settings: "settings",
+  settings_menu: "settings\n\ncurrent email · {email}\n\ntasks are matched to this address",
+  settings_change_email: "change email",
+  settings_restart: "restart",
+  settings_ask_email: "send the email connected to your Notion account — that's how i find your tasks",
+  settings_email_saved: "updated ✦ i'll look up tasks for {email}",
+  settings_email_invalid: "that doesn't look like an email — try again",
+  settings_email_taken: "that email is already linked to another telegram account",
   menu_back: "← back",
   menu_nav_menu: "← menu",
   onfire_header: "tasks with deadline this week 🔥",
@@ -85,6 +101,10 @@ const DEFAULT_MESSAGES = {
 
 function normalizeKey(s) {
   return String(s || "").trim().toLowerCase();
+}
+
+function isPlausibleEmail(s) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s || "").trim());
 }
 
 function normalizeTemplateVarKey(raw) {
@@ -601,14 +621,139 @@ async function mainMenuKeyboard(db) {
   const tTasks = await formatMessage(db, MessageTags.menuTasks, {});
   const tProjects = await formatMessage(db, MessageTags.menuProjects, {});
   const tNewTask = await formatMessage(db, MessageTags.menuNewTask, {});
+  const tSettings = await formatMessage(db, MessageTags.menuSettings, {});
   return {
     inline_keyboard: [
       [{ text: tOnFire, callback_data: "menu:onfire" }],
       [{ text: tTasks, callback_data: "menu:tasks" }],
       [{ text: tProjects, callback_data: "menu:projects" }],
       [{ text: tNewTask, callback_data: "menu:newtask" }],
+      [{ text: tSettings, callback_data: "menu:settings" }],
     ],
   };
+}
+
+async function settingsKeyboard(db) {
+  const change = await formatMessage(db, MessageTags.settingsChangeEmail, {});
+  const restart = await formatMessage(db, MessageTags.settingsRestart, {});
+  const back = await formatMessage(db, MessageTags.menuNavMenu, {});
+  return {
+    inline_keyboard: [
+      [{ text: change, callback_data: "settings:email" }],
+      [{ text: restart, callback_data: "settings:restart" }],
+      [{ text: back, callback_data: "menu:back" }],
+    ],
+  };
+}
+
+async function clearSettingsStep(db, telegramUserId) {
+  await db.prepare("DELETE FROM parameters WHERE parameter_key=?").bind(`settings_step_${telegramUserId}`).run();
+}
+
+async function showSettings(env, db, chatId, from) {
+  const p = await getProfileByTelegramUserId(db, from.id);
+  if (!p) return handleStart(env, db, chatId, from);
+  const text = await formatMessage(db, MessageTags.settingsMenu, { email: p.user_email });
+  await sendTelegramMessage(env, {
+    chat_id: chatId,
+    text,
+    reply_markup: await settingsKeyboard(db),
+  });
+}
+
+async function restartRegistration(env, db, chatId, from) {
+  const p = await getProfileByTelegramUserId(db, from.id);
+  if (p) {
+    await db.prepare("UPDATE profiles SET telegram_user_id=NULL WHERE user_email=?").bind(p.user_email).run();
+  }
+  await db
+    .prepare("DELETE FROM parameters WHERE parameter_key IN (?,?,?,?,?)")
+    .bind(
+      `settings_step_${from.id}`,
+      `onboarding_step_${from.id}`,
+      `onboarding_state_${from.id}`,
+      `settask_step_${from.id}`,
+      `settask_state_${from.id}`,
+    )
+    .run();
+  await handleStart(env, db, chatId, from);
+}
+
+async function startChangeEmail(env, db, chatId, from) {
+  const p = await getProfileByTelegramUserId(db, from.id);
+  if (!p) return handleStart(env, db, chatId, from);
+  await db
+    .prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
+    .bind(`settings_step_${from.id}`, "email")
+    .run();
+  const ask = await formatMessage(db, MessageTags.settingsAskEmail, { email: p.user_email });
+  const back = await formatMessage(db, MessageTags.menuNavMenu, {});
+  await sendTelegramMessage(env, {
+    chat_id: chatId,
+    text: ask,
+    reply_markup: { inline_keyboard: [[{ text: back, callback_data: "menu:back" }]] },
+  });
+}
+
+/**
+ * user_email is the profiles primary key. Rename by copying the row, moving
+ * related rows, then deleting the old one so foreign keys stay valid.
+ * If the new address already exists without a Telegram link, attach this user to it.
+ */
+async function changeProfileEmail(db, profile, newEmail) {
+  const oldEmail = profile.user_email;
+  if (normalizeKey(oldEmail) === normalizeKey(newEmail)) {
+    return await getProfileByEmail(db, oldEmail);
+  }
+
+  const taken = await getProfileByEmail(db, newEmail);
+  if (taken) {
+    if (taken.telegram_user_id && String(taken.telegram_user_id) !== String(profile.telegram_user_id || "")) {
+      return { error: "taken" };
+    }
+    await db.batch([
+      db.prepare("UPDATE profiles SET telegram_user_id=NULL WHERE user_email=?").bind(oldEmail),
+      db
+        .prepare(
+          "UPDATE profiles SET telegram_user_id=?, telegram_username=?, notion_user_id=NULL WHERE user_email=?",
+        )
+        .bind(String(profile.telegram_user_id), profile.telegram_username || null, taken.user_email),
+    ]);
+    return await getProfileByEmail(db, taken.user_email);
+  }
+
+  await db.batch([
+    db.prepare("UPDATE profiles SET telegram_user_id=NULL WHERE user_email=?").bind(oldEmail),
+    db
+      .prepare(
+        `INSERT INTO profiles (
+          user_email, user_name, telegram_username, profile_image_link, notion_user_id,
+          telegram_user_id, timezone, reminder_time, sparks, streak, completed_tasks, last_activity_date, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .bind(
+        newEmail,
+        profile.user_name,
+        profile.telegram_username || null,
+        profile.profile_image_link || null,
+        null,
+        profile.telegram_user_id ? String(profile.telegram_user_id) : null,
+        profile.timezone || null,
+        profile.reminder_time || null,
+        Number.isFinite(Number(profile.sparks)) ? Number(profile.sparks) : 0,
+        Number.isFinite(Number(profile.streak)) ? Number(profile.streak) : 0,
+        Number.isFinite(Number(profile.completed_tasks)) ? Number(profile.completed_tasks) : 0,
+        profile.last_activity_date || null,
+        profile.created_at || new Date().toISOString(),
+      ),
+    db.prepare("UPDATE inventory SET user_email=? WHERE user_email=?").bind(newEmail, oldEmail),
+    db.prepare("UPDATE sparks_ledger SET user_email=? WHERE user_email=?").bind(newEmail, oldEmail),
+    db
+      .prepare("UPDATE projects SET project_owner_email=? WHERE lower(project_owner_email)=lower(?)")
+      .bind(newEmail, oldEmail),
+    db.prepare("DELETE FROM profiles WHERE user_email=?").bind(oldEmail),
+  ]);
+  return await getProfileByEmail(db, newEmail);
 }
 
 async function finishOnboarding(env, db, chatId, from, profile) {
@@ -1211,6 +1356,7 @@ async function ensureNotionUserIdForEmail(env, db, profile) {
 async function handleStart(env, db, chatId, from) {
   const intro = await formatMessage(db, MessageTags.onboardingIntro, {});
   const askName = await formatMessage(db, MessageTags.onboardingAskName, {});
+  await clearSettingsStep(db, from.id);
   await telegramApi(env, "sendMessage", { chat_id: chatId, text: intro });
   await telegramApi(env, "sendMessage", { chat_id: chatId, text: askName });
   // Store pending step in a lightweight way (D1 parameters table used as KV for MVP).
@@ -1254,13 +1400,29 @@ async function handleOnboardingText(env, db, chatId, from, text) {
 
     const existingByEmail = await getProfileByEmail(db, state.user_email);
     let profile;
+    if (existingByEmail && existingByEmail.telegram_user_id && String(existingByEmail.telegram_user_id) !== String(from.id)) {
+      const taken = await formatMessage(db, MessageTags.settingsEmailTaken, { email: state.user_email });
+      await telegramApi(env, "sendMessage", { chat_id: chatId, text: taken });
+      return true;
+    }
     if (existingByEmail) {
-      profile = await upsertProfile(db, {
-        ...existingByEmail,
-        telegram_user_id: String(from.id),
-        telegram_username: from.username ? String(from.username) : existingByEmail.telegram_username,
-      });
+      await db
+        .prepare(
+          "UPDATE profiles SET user_name=?, telegram_user_id=?, telegram_username=?, notion_user_id=NULL WHERE user_email=?",
+        )
+        .bind(
+          state.user_name || existingByEmail.user_name,
+          String(from.id),
+          from.username ? String(from.username) : existingByEmail.telegram_username || null,
+          existingByEmail.user_email,
+        )
+        .run();
+      profile = await getProfileByEmail(db, existingByEmail.user_email);
     } else {
+      const linked = await getProfileByTelegramUserId(db, from.id);
+      if (linked) {
+        await db.prepare("UPDATE profiles SET telegram_user_id=NULL WHERE user_email=?").bind(linked.user_email).run();
+      }
       profile = await upsertProfile(db, {
         user_name: state.user_name || "Unknown",
         user_email: state.user_email || "",
@@ -1335,6 +1497,26 @@ async function handleSettingsText(env, db, chatId, from, text) {
     const ok = await formatMessage(db, MessageTags.settingsSaved, {});
     await telegramApi(env, "sendMessage", { chat_id: chatId, text: ok });
     await showProfile(env, db, chatId, from);
+    return true;
+  }
+
+  if (step === "email") {
+    const raw = text.trim().toLowerCase();
+    if (!isPlausibleEmail(raw)) {
+      const ask = await formatMessage(db, MessageTags.settingsEmailInvalid, {});
+      await telegramApi(env, "sendMessage", { chat_id: chatId, text: ask });
+      return true;
+    }
+    const updated = await changeProfileEmail(db, p, raw);
+    if (updated && updated.error === "taken") {
+      const t = await formatMessage(db, MessageTags.settingsEmailTaken, { email: raw });
+      await telegramApi(env, "sendMessage", { chat_id: chatId, text: t });
+      return true;
+    }
+    await env.DB.prepare("DELETE FROM parameters WHERE parameter_key=?").bind(stepKey).run();
+    await ensureNotionUserIdForEmail(env, db, updated);
+    const ok = await formatMessage(db, MessageTags.settingsEmailSaved, { email: updated.user_email });
+    await sendTelegramMessage(env, { chat_id: chatId, text: ok, reply_markup: await mainMenuKeyboard(db) });
     return true;
   }
 
@@ -2100,13 +2282,15 @@ export default {
             return new Response("ok");
           }
           if (/^\/menu(?:@[A-Za-z0-9_]+)?(?:\s|$)/.test(String(text || "")) || /^(menu|меню)$/i.test(String(text || "").trim())) {
+            await clearSettingsStep(db, from.id);
             const menu = await formatMessage(db, MessageTags.menuMain, {});
             await telegramApi(env, "sendMessage", { chat_id: chatId, text: menu, reply_markup: await mainMenuKeyboard(db) });
             return new Response("ok");
           }
           const handled = await handleOnboardingText(env, db, chatId, from, text);
           const handledSetTask = handled ? false : await handleSetTaskText(env, db, chatId, from, text);
-          if (!handled && !handledSetTask) {
+          const handledSettings = handled || handledSetTask ? false : await handleSettingsText(env, db, chatId, from, text);
+          if (!handled && !handledSetTask && !handledSettings) {
             const menu = await formatMessage(db, MessageTags.menuMain, {});
             await sendTelegramMessage(env, {
               chat_id: chatId,
@@ -2140,7 +2324,11 @@ export default {
             else if (data === "menu:onfire") await showOnFire(env, db, chatId, from);
             else if (data === "menu:projects") await showProjects(env, db, chatId, from);
             else if (data === "menu:newtask") await startSetTaskFlow(env, db, chatId, from);
+            else if (data === "menu:settings") await showSettings(env, db, chatId, from);
+            else if (data === "settings:email") await startChangeEmail(env, db, chatId, from);
+            else if (data === "settings:restart") await restartRegistration(env, db, chatId, from);
             else if (data === "menu:back") {
+              await clearSettingsStep(db, from.id);
               const menu = await formatMessage(db, MessageTags.menuMain, {});
               await sendTelegramMessage(env, {
                 chat_id: chatId,
