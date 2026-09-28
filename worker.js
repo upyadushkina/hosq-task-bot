@@ -1289,6 +1289,10 @@ function isPastProject(project, today) {
   return Boolean(end && end < today);
 }
 
+function hasProjectDate(project, today) {
+  return Boolean(ymdOrEmpty(project.start, today) || ymdOrEmpty(project.end, today));
+}
+
 function compareCurrentProjects(a, b, today) {
   const rank = (project) => {
     const end = ymdOrEmpty(project.end, today);
@@ -1454,7 +1458,9 @@ async function listAllNotionProjects(env) {
 async function syncProjectsForUserFromNotion(env, db, profile) {
   const tz = profile.timezone || "UTC";
   const today = ymdFromDateInTimeZone(new Date(), tz);
-  const projects = (await listOwnedNotionProjects(env, profile)).filter((project) => !isPastProject(project, today));
+  const projects = (await listOwnedNotionProjects(env, profile)).filter(
+    (project) => hasProjectDate(project, today) && !isPastProject(project, today),
+  );
   await db.prepare("DELETE FROM projects WHERE lower(project_owner_email)=?").bind(normalizeKey(profile.user_email)).run();
   for (const project of projects) {
     await db
@@ -1499,6 +1505,21 @@ async function listTasksForProject(env, projectId) {
   return pages.filter((page) => page && page.object === "page" && !page.archived);
 }
 
+function streamHashtags(prop) {
+  if (!prop) return "";
+  const multi = multiSelectNames(prop);
+  const parts = multi.length
+    ? multi
+    : propPlain(prop)
+        .split(/[,;/|]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+  return parts
+    .map((s) => `#${escapeHtml(String(s).replace(/\s+/g, ""))}`)
+    .filter((s) => s !== "#")
+    .join(" ");
+}
+
 function projectCardText(page, today) {
   const props = (page && page.properties) || {};
   const name = firstTitleFromAnyProperty(props) || "untitled";
@@ -1506,19 +1527,19 @@ function projectCardText(page, today) {
   const dates = formatProjectDatesLine(range.start, range.end, today);
   const ownerProp = findNamedProp(props, /project owner|^owner$/i) || pickFirstPropByNames(props, ["Project owner", "Project Owner", "Owner"]);
   const owner = peopleLabel(ownerProp || {});
-  const stream = propPlain(findNamedProp(props, /stream/i) || {});
+  const stream = streamHashtags(findNamedProp(props, /stream/i));
   const status = projectStatusFromProps(props);
   const description = propPlain(pickFirstPropByNames(props, ["Description", "description"]) || {}).slice(0, 3000);
 
-  const lines = [name];
-  if (dates) lines.push(dates);
-  if (owner) lines.push(owner);
+  const lines = [`<b>${escapeHtml(name)}</b>`];
+  if (dates) lines.push(escapeHtml(dates));
+  if (owner) lines.push(`project owner 🧚: ${escapeHtml(owner)}`);
   if (stream || status) lines.push("");
   if (stream) lines.push(stream);
-  if (status) lines.push(status);
+  if (status) lines.push(escapeHtml(status));
   if (description) {
     lines.push("");
-    lines.push(description);
+    lines.push(escapeHtml(description));
   }
   return lines.join("\n");
 }
@@ -1526,7 +1547,8 @@ function projectCardText(page, today) {
 async function showProjectCard(env, db, chatId, from, projectId, backCallback) {
   const p = await getProfileByTelegramUserId(db, from.id);
   if (!p) return handleStart(env, db, chatId, from);
-  const kind = backCallback === "menu:allprojects" ? "a" : backCallback === "projects:past" ? "p" : "m";
+  const kind =
+    backCallback === "menu:allprojects" ? "a" : backCallback === "projects:allpast" ? "b" : backCallback === "projects:past" ? "p" : "m";
   await setTaskListBack(db, from.id, `popen:${kind}:${notionId(projectId)}`);
   const tz = p.timezone || (await getParameter(db, "default_timezone")) || "UTC";
   const today = ymdFromDateInTimeZone(new Date(), tz);
@@ -1553,15 +1575,22 @@ async function showProjectCard(env, db, chatId, from, projectId, backCallback) {
   });
 
   const nav = await listNavKeyboard(db, backCallback);
+  const openNotion = await formatMessage(db, MessageTags.taskActionOpenNotion, {});
   const keyboard = {
     inline_keyboard: [
+      [{ text: openNotion, url: notionPageUrl(projectId) }],
       ...tasks.slice(0, 30).map((task) => [
         { text: taskGalleryLabel(task, env, today), callback_data: `task:open:${task.id}` },
       ]),
       ...nav.inline_keyboard,
     ],
   };
-  await sendTelegramMessage(env, { chat_id: chatId, text: projectCardText(page, today), reply_markup: keyboard });
+  await sendTelegramMessage(env, {
+    chat_id: chatId,
+    text: projectCardText(page, today),
+    reply_markup: keyboard,
+    parse_mode: "HTML",
+  });
 }
 
 async function sendProjectList(env, db, chatId, projects, { header, today, kind, extraButtons, backCallback, emptyText }) {
@@ -1980,8 +2009,9 @@ async function loadOwnedProjects(env, db, profile) {
   const projects = await listOwnedNotionProjects(env, profile);
   const tz = profile.timezone || (await getParameter(db, "default_timezone")) || "UTC";
   const today = ymdFromDateInTimeZone(new Date(), tz);
-  const current = projects.filter((project) => !isPastProject(project, today)).sort((a, b) => compareCurrentProjects(a, b, today));
-  const past = projects.filter((project) => isPastProject(project, today)).sort((a, b) => comparePastProjects(a, b, today));
+  const dated = projects.filter((project) => hasProjectDate(project, today));
+  const current = dated.filter((project) => !isPastProject(project, today)).sort((a, b) => compareCurrentProjects(a, b, today));
+  const past = dated.filter((project) => isPastProject(project, today)).sort((a, b) => comparePastProjects(a, b, today));
   await db.prepare("DELETE FROM projects WHERE lower(project_owner_email)=?").bind(normalizeKey(profile.user_email)).run();
   for (const project of current) {
     await db
@@ -2071,14 +2101,51 @@ async function showAllProjects(env, db, chatId, from) {
     });
     return;
   }
-  const current = projects.filter((project) => !isPastProject(project, today)).sort((a, b) => compareCurrentProjects(a, b, today));
-  const header = await formatMessage(db, MessageTags.projectsAllHeader, {});
+  const dated = projects.filter((project) => hasProjectDate(project, today));
+  const current = dated.filter((project) => !isPastProject(project, today)).sort((a, b) => compareCurrentProjects(a, b, today));
+  const past = dated.filter((project) => isPastProject(project, today));
   const emptyText = await formatMessage(db, MessageTags.projectsEmpty, {});
+  if (!current.length && !past.length) {
+    await sendTelegramMessage(env, { chat_id: chatId, text: emptyText, reply_markup: await mainMenuKeyboard(db) });
+    return;
+  }
+  const pastBtn = past.length
+    ? [[{ text: await formatMessage(db, MessageTags.menuPastProjects, {}), callback_data: "projects:allpast" }]]
+    : [];
+  const header = await formatMessage(db, MessageTags.projectsAllHeader, {});
   await sendProjectList(env, db, chatId, current, {
     header,
     today,
     kind: "a",
+    extraButtons: pastBtn,
     backCallback: "menu:back",
+    emptyText,
+  });
+}
+
+async function showAllPastProjects(env, db, chatId, from) {
+  const p = await getProfileByTelegramUserId(db, from.id);
+  if (!p) return handleStart(env, db, chatId, from);
+  const tz = p.timezone || (await getParameter(db, "default_timezone")) || "UTC";
+  const today = ymdFromDateInTimeZone(new Date(), tz);
+  let projects = [];
+  try {
+    projects = await listAllNotionProjects(env);
+  } catch (e) {
+    console.error("showAllPastProjects notion error:", e);
+    await sendTelegramMessage(env, { chat_id: chatId, text: String(e), reply_markup: await mainMenuKeyboard(db) });
+    return;
+  }
+  const past = projects
+    .filter((project) => hasProjectDate(project, today) && isPastProject(project, today))
+    .sort((a, b) => comparePastProjects(a, b, today));
+  const header = await formatMessage(db, MessageTags.projectsPastHeader, {});
+  const emptyText = await formatMessage(db, MessageTags.projectsEmpty, {});
+  await sendProjectList(env, db, chatId, past, {
+    header,
+    today,
+    kind: "b",
+    backCallback: "menu:allprojects",
     emptyText,
   });
 }
@@ -2156,7 +2223,8 @@ async function renderTaskCard(env, db, page) {
   const props = page.properties || {};
   const tz = "UTC";
   const today = ymdFromDateInTimeZone(new Date(), tz);
-  const title = escapeHtml(taskTitleFromPage(page));
+  const plainTitle = taskTitleFromPage(page);
+  const title = escapeHtml(plainTitle);
   const rawDeadline = deadlineFromProps(props, env);
   const deadlineYmd = parseLooseDeadlineToYmd(rawDeadline, today);
   const deadline = deadlineYmd ? formatDeadlineShort(deadlineYmd, today) : escapeHtml(rawDeadline || "—");
@@ -2173,7 +2241,7 @@ async function renderTaskCard(env, db, page) {
 
   const consult = await consultDisplayFromProps(db, props, env, today);
 
-  const text = await formatMessage(db, MessageTags.taskCardTemplate, {
+  let text = await formatMessage(db, MessageTags.taskCardTemplate, {
     title,
     deadline,
     project,
@@ -2184,10 +2252,12 @@ async function renderTaskCard(env, db, page) {
     consult_name: escapeHtml(consult.name),
     consult_username: consult.username ? escapeHtml(consult.username) : "",
   });
-  return text
+  text = text
     .replace(/(^|\n)[ \t]*status\s*·[^\n]*/gi, "$1")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+  if (title && !text.includes(`<b>${title}</b>`)) text = text.replace(title, `<b>${title}</b>`);
+  return text;
 }
 
 async function openTaskReadonly(env, db, chatId, pageId, backCb) {
@@ -2201,7 +2271,7 @@ async function openTaskReadonly(env, db, chatId, pageId, backCb) {
   const keyboard = {
     inline_keyboard: [[{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: backCb }]],
   };
-  await telegramApi(env, "sendMessage", { chat_id: chatId, text, reply_markup: keyboard });
+  await telegramApi(env, "sendMessage", { chat_id: chatId, text, reply_markup: keyboard, parse_mode: "HTML" });
 }
 
 async function showTeamMemberTasks(env, db, chatId, from, targetTelegramUserId) {
@@ -2778,6 +2848,7 @@ export default {
             else if (data === "menu:onfire") await showOnFire(env, db, chatId, from);
             else if (data === "menu:projects") await showProjects(env, db, chatId, from);
             else if (data === "projects:past") await showPastProjects(env, db, chatId, from);
+            else if (data === "projects:allpast") await showAllPastProjects(env, db, chatId, from);
             else if (data === "menu:allprojects") await showAllProjects(env, db, chatId, from);
             else if (data === "menu:newtask") await startSetTaskFlow(env, db, chatId, from);
             else if (data === "menu:settings") await showSettings(env, db, chatId, from);
@@ -2795,7 +2866,8 @@ export default {
               const rest = data.slice("popen:".length);
               const kind = rest.slice(0, 1);
               const id = rest.slice(2);
-              const back = kind === "a" ? "menu:allprojects" : kind === "p" ? "projects:past" : "menu:projects";
+              const back =
+                kind === "a" ? "menu:allprojects" : kind === "b" ? "projects:allpast" : kind === "p" ? "projects:past" : "menu:projects";
               await showProjectCard(env, db, chatId, from, id, back);
             } else if (data.startsWith("project:open:")) {
               await showProjectCard(env, db, chatId, from, data.slice("project:open:".length), "menu:projects");
