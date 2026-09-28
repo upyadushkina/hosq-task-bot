@@ -92,7 +92,7 @@ const DEFAULT_MESSAGES = {
   task_done_success: "✦ marked as done, nice job",
   task_not_found: "task not found",
   settask_ask_title: "what's the task?",
-  settask_ask_deadline: "deadline? (YYYY-MM-DD)",
+  settask_ask_deadline: "pick a deadline",
   settask_ask_priority: "pick priority:",
   settask_ask_project: "link to a project?",
   settask_no_project: "no project",
@@ -835,6 +835,19 @@ function peopleIds(prop) {
   return arr.map((p) => (p && p.id ? String(p.id) : null)).filter(Boolean);
 }
 
+// hosq projects database (Notion). Override with NOTION_PROJECTS_DB_ID if the link changes.
+const DEFAULT_NOTION_PROJECTS_DB_ID = "69103175-b03c-82a3-ba36-815c076b68e9";
+
+function notionId(raw) {
+  const s = String(raw || "").replace(/-/g, "").trim();
+  if (!/^[0-9a-fA-F]{32}$/.test(s)) return String(raw || "").trim();
+  return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20)}`.toLowerCase();
+}
+
+function projectsDatabaseId(env) {
+  return notionId(env.NOTION_PROJECTS_DB_ID || DEFAULT_NOTION_PROJECTS_DB_ID);
+}
+
 // Hosq Tasks DB schema (override via env if your workspace uses different names).
 const NotionTaskProps = {
   taskName: "Task name",
@@ -1070,9 +1083,11 @@ async function buildCreateTaskProperties(env, db, profile, task) {
     props[deadlineKey] = { date: { start: task.deadline } };
   }
 
-  const priorityKey = notionPropName(env, "priority", NotionTaskProps.priority);
-  if (schemaHasProperty(schemaProps, priorityKey, "select")) {
-    props[priorityKey] = { select: { name: task.priority } };
+  if (task.priority) {
+    const priorityKey = notionPropName(env, "priority", NotionTaskProps.priority);
+    if (schemaHasProperty(schemaProps, priorityKey, "select")) {
+      props[priorityKey] = { select: { name: task.priority } };
+    }
   }
 
   const responsibleKey = findPeoplePropertyKey(schemaProps, [
@@ -1213,29 +1228,97 @@ function connectedProjectRelationIdsFromTask(page) {
   return relationPageIds(prop || {});
 }
 
+function findProjectOwnerPropertyKey(schemaProps) {
+  const props = schemaProps || {};
+  const preferred = ["Project owner", "Project Owner", "Owner"];
+  for (const name of preferred) {
+    const t = props[name] && props[name].type;
+    if (t === "people" || t === "email") return name;
+  }
+  for (const k of Object.keys(props)) {
+    const t = props[k] && props[k].type;
+    if ((t === "people" || t === "email") && /owner/i.test(k)) return k;
+  }
+  return null;
+}
+
+function projectStatusFromProps(props) {
+  const prop = pickFirstPropByNames(props, ["Status", "Project status", "status"]);
+  return statusOrSelectName(prop || {}) || "active";
+}
+
+function pageOwnedByProfile(page, ownerKey, ownerType, profile) {
+  const prop = page && page.properties ? page.properties[ownerKey] : null;
+  if (ownerType === "email") {
+    return normalizeKey(emailValue(prop)) === normalizeKey(profile.user_email);
+  }
+  const ids = peopleIds(prop);
+  const emails = peopleEmails(prop).map(normalizeKey);
+  if (profile.notion_user_id && ids.includes(String(profile.notion_user_id))) return true;
+  return emails.includes(normalizeKey(profile.user_email));
+}
+
+async function notionQueryProjectsDatabase(env, body) {
+  const dbId = projectsDatabaseId(env);
+  return await notionFetch(env, `/databases/${dbId}/query`, {
+    method: "POST",
+    body: JSON.stringify(body || {}),
+  });
+}
+
+async function listOwnedNotionProjects(env, profile) {
+  const dbId = projectsDatabaseId(env);
+  const schema = await notionFetch(env, `/databases/${dbId}`, { method: "GET" });
+  const schemaProps = schema.properties || {};
+  const ownerKey = findProjectOwnerPropertyKey(schemaProps);
+  if (!ownerKey) {
+    throw new Error("Projects database has no Project owner field");
+  }
+  const ownerType = schemaProps[ownerKey].type;
+  const titleKey = findTitlePropertyKey(schemaProps, null);
+
+  let filter = null;
+  if (ownerType === "people" && profile.notion_user_id) {
+    filter = { property: ownerKey, people: { contains: String(profile.notion_user_id) } };
+  } else if (ownerType === "email" && profile.user_email) {
+    filter = { property: ownerKey, email: { equals: String(profile.user_email) } };
+  }
+
+  const pages = [];
+  let cursor = null;
+  do {
+    const body = { page_size: 100 };
+    if (filter) body.filter = filter;
+    if (cursor) body.start_cursor = cursor;
+    const res = await notionQueryProjectsDatabase(env, body);
+    pages.push(...(res.results || []));
+    cursor = res.has_more ? res.next_cursor : null;
+  } while (cursor && pages.length < 300);
+
+  const owned = filter ? pages : pages.filter((page) => pageOwnedByProfile(page, ownerKey, ownerType, profile));
+  return owned
+    .filter((page) => page && page.object !== "database" && !page.archived)
+    .map((page) => {
+      const props = page.properties || {};
+      const fromTitle = titleKey && props[titleKey] ? firstTextFromTitle(props[titleKey]) : "";
+      const name = fromTitle || firstTitleFromAnyProperty(props) || "untitled";
+      return {
+        id: String(page.id),
+        name,
+        status: projectStatusFromProps(props),
+      };
+    });
+}
+
 async function syncProjectsForUserFromNotion(env, db, profile) {
-  // Build projects list from user's tasks (Connected Project relation).
-  let tasks = [];
-  try {
-    tasks = await collectActiveNotionTasksForProfile(env, profile, 400);
-  } catch (e) {
-    console.error("syncProjectsForUserFromNotion notion error:", e);
-    return;
-  }
-
-  const ids = new Set();
-  for (const t of tasks) {
-    for (const id of connectedProjectRelationIdsFromTask(t)) ids.add(id);
-  }
-  const projectIds = Array.from(ids);
-  if (!projectIds.length) return;
-
-  for (const projectId of projectIds) {
-    const name = await notionGetPageTitle(env, projectId);
-    await env.DB.prepare(
-      "INSERT OR REPLACE INTO projects(project_tag, project_name, project_owner_email, project_status) VALUES(?,?,?,?)",
-    )
-      .bind(projectId, name, profile.user_email, "active")
+  const projects = await listOwnedNotionProjects(env, profile);
+  await db.prepare("DELETE FROM projects WHERE lower(project_owner_email)=?").bind(normalizeKey(profile.user_email)).run();
+  for (const project of projects) {
+    await db
+      .prepare(
+        "INSERT OR REPLACE INTO projects(project_tag, project_name, project_owner_email, project_status) VALUES(?,?,?,?)",
+      )
+      .bind(project.id, project.name, profile.user_email, project.status || "active")
       .run();
   }
 }
@@ -1682,7 +1765,19 @@ async function showProjects(env, db, chatId, from) {
     return;
   }
   await ensureNotionUserIdForEmail(env, db, p);
-  await syncProjectsForUserFromNotion(env, db, p);
+  try {
+    await syncProjectsForUserFromNotion(env, db, p);
+  } catch (e) {
+    console.error("showProjects notion error:", e);
+    await sendTelegramMessage(env, {
+      chat_id: chatId,
+      text:
+        "Could not load projects from Notion. Invite the bot integration to the projects database.\n\n" +
+        `Details: ${String(e)}`,
+      reply_markup: await mainMenuKeyboard(db),
+    });
+    return;
+  }
   const projects = await dbAll(
     db,
     "SELECT project_tag, project_name, project_status FROM projects WHERE lower(project_owner_email)=? ORDER BY project_name",
@@ -1700,7 +1795,9 @@ async function showProjects(env, db, chatId, from) {
     text: header,
     reply_markup: {
       inline_keyboard: [
-        ...projects.map((x) => [{ text: x.project_name, callback_data: `project:open:${x.project_tag}` }]),
+        ...projects.map((x) => [
+          { text: String(x.project_name || "project").slice(0, 60), callback_data: `project:open:${x.project_tag}` },
+        ]),
         ...nav.inline_keyboard,
       ],
     },
@@ -2014,6 +2111,77 @@ function parseISODate(s) {
   return t;
 }
 
+function shiftMonth(year, month, delta) {
+  const dt = new Date(Date.UTC(year, month - 1 + delta, 1));
+  return { year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1 };
+}
+
+async function deadlineCalendarKeyboard(db, year, month, todayYmd) {
+  const first = new Date(Date.UTC(year, month - 1, 1));
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const startDow = (first.getUTCDay() + 6) % 7;
+  const label = new Intl.DateTimeFormat("en-US", { month: "short", year: "numeric", timeZone: "UTC" }).format(first);
+  const prev = shiftMonth(year, month, -1);
+  const next = shiftMonth(year, month, 1);
+  const pad = (n) => String(n).padStart(2, "0");
+  const ym = (y, m) => `${y}-${pad(m)}`;
+
+  const rows = [
+    [
+      { text: "‹", callback_data: `settask:cal:${ym(prev.year, prev.month)}` },
+      { text: label, callback_data: "settask:cal:noop" },
+      { text: "›", callback_data: `settask:cal:${ym(next.year, next.month)}` },
+    ],
+    ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].map((d) => ({ text: d, callback_data: "settask:cal:noop" })),
+  ];
+
+  const cells = [];
+  for (let i = 0; i < startDow; i++) cells.push({ text: "·", callback_data: "settask:cal:noop" });
+  for (let d = 1; d <= daysInMonth; d++) {
+    const ymd = `${year}-${pad(month)}-${pad(d)}`;
+    cells.push({ text: ymd === todayYmd ? `[${d}]` : String(d), callback_data: `settask:date:${ymd}` });
+  }
+  while (cells.length % 7 !== 0) cells.push({ text: "·", callback_data: "settask:cal:noop" });
+  for (let i = 0; i < cells.length; i += 7) rows.push(cells.slice(i, i + 7));
+  rows.push([{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "menu:back" }]);
+  return { inline_keyboard: rows };
+}
+
+async function promptSetTaskDeadline(env, db, chatId, from, profile) {
+  const tz = (profile && profile.timezone) || (await getParameter(db, "default_timezone")) || "UTC";
+  const today = ymdFromDateInTimeZone(new Date(), tz);
+  const [year, month] = today.split("-").map(Number);
+  await db
+    .prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
+    .bind(`settask_step_${from.id}`, "deadline")
+    .run();
+  const ask = await formatMessage(db, MessageTags.setTaskAskDeadline, {});
+  await sendTelegramMessage(env, {
+    chat_id: chatId,
+    text: ask,
+    reply_markup: await deadlineCalendarKeyboard(db, year, month, today),
+  });
+}
+
+async function promptSetTaskProject(env, db, chatId, from, profile) {
+  await db
+    .prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
+    .bind(`settask_step_${from.id}`, "project")
+    .run();
+  try {
+    await ensureNotionUserIdForEmail(env, db, profile);
+    await syncProjectsForUserFromNotion(env, db, profile);
+  } catch (e) {
+    console.error("promptSetTaskProject projects error:", e);
+  }
+  const ask = await formatMessage(db, MessageTags.setTaskAskProject, {});
+  await telegramApi(env, "sendMessage", {
+    chat_id: chatId,
+    text: ask,
+    reply_markup: await setTaskProjectKeyboard(env, db, profile),
+  });
+}
+
 async function startSetTaskFlow(env, db, chatId, from) {
   await env.DB.prepare("DELETE FROM parameters WHERE parameter_key IN (?,?)")
     .bind(`settask_step_${from.id}`, `settask_state_${from.id}`)
@@ -2025,16 +2193,6 @@ async function startSetTaskFlow(env, db, chatId, from) {
   await telegramApi(env, "sendMessage", { chat_id: chatId, text: ask });
 }
 
-async function setTaskPriorityKeyboard(db) {
-  const opts = ["Low", "Medium", "Upper Medium", "High", "VERY HIGH"];
-  return {
-    inline_keyboard: [
-      ...opts.map((name) => [{ text: name, callback_data: `settask:priority:${name}` }]),
-      [{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "menu:back" }],
-    ],
-  };
-}
-
 async function setTaskProjectKeyboard(env, db, profile) {
   const rows = await dbAll(
     db,
@@ -2044,7 +2202,9 @@ async function setTaskProjectKeyboard(env, db, profile) {
   const noProjText = await formatMessage(db, MessageTags.setTaskNoProject, {});
   return {
     inline_keyboard: [
-      ...rows.map((r) => [{ text: r.project_name, callback_data: `settask:project:${r.project_tag}` }]),
+      ...rows.map((r) => [
+        { text: String(r.project_name || "project").slice(0, 40), callback_data: `settask:project:${r.project_tag}` },
+      ]),
       [{ text: noProjText, callback_data: "settask:project:none" }],
       [{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "menu:back" }],
     ],
@@ -2065,34 +2225,22 @@ async function handleSetTaskText(env, db, chatId, from, text) {
   if (!p) return false;
 
   if (step === "title") {
-    state.title = String(text || "").trim();
+    const title = String(text || "").trim();
+    if (!title) {
+      const ask = await formatMessage(db, MessageTags.setTaskAskTitle, {});
+      await telegramApi(env, "sendMessage", { chat_id: chatId, text: ask });
+      return true;
+    }
+    state.title = title;
     await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
       .bind(stateKey, JSON.stringify(state))
       .run();
-    await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
-      .bind(stepKey, "deadline")
-      .run();
-    const ask = await formatMessage(db, MessageTags.setTaskAskDeadline, {});
-    await telegramApi(env, "sendMessage", { chat_id: chatId, text: ask });
+    await promptSetTaskDeadline(env, db, chatId, from, p);
     return true;
   }
 
   if (step === "deadline") {
-    const d = parseISODate(text);
-    if (!d) {
-      const ask = await formatMessage(db, MessageTags.setTaskAskDeadline, {});
-      await telegramApi(env, "sendMessage", { chat_id: chatId, text: ask });
-      return true;
-    }
-    state.deadline = d;
-    await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
-      .bind(stateKey, JSON.stringify(state))
-      .run();
-    await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
-      .bind(stepKey, "priority")
-      .run();
-    const ask = await formatMessage(db, MessageTags.setTaskAskPriority, {});
-    await telegramApi(env, "sendMessage", { chat_id: chatId, text: ask, reply_markup: await setTaskPriorityKeyboard(db) });
+    await promptSetTaskDeadline(env, db, chatId, from, p);
     return true;
   }
 
@@ -2265,6 +2413,19 @@ export default {
         const db = env.DB;
         if (!db) {
           console.error("Missing D1 binding env.DB — add D1 binding named DB in Worker settings.");
+          try {
+            const message = update.message || update.edited_message;
+            const callback = update.callback_query;
+            const chatId = (message && message.chat && message.chat.id) || (callback && callback.message && callback.message.chat && callback.message.chat.id);
+            if (chatId) {
+              await telegramApi(env, "sendMessage", {
+                chat_id: chatId,
+                text: "i can't answer yet — the database isn't connected. in Cloudflare, bind D1 to this worker with variable name DB, then redeploy.",
+              });
+            }
+          } catch (e) {
+            console.error("failed to report missing DB:", e);
+          }
           return new Response("ok");
         }
 
@@ -2337,78 +2498,95 @@ export default {
               });
             } else if (data.startsWith("project:open:")) {
               await showProjectTasks(env, db, chatId, from, data.slice("project:open:".length));
+            } else if (data === "settask:cal:noop") {
+              // weekday labels and empty calendar cells
+            } else if (data.startsWith("settask:cal:")) {
+              const ym = data.slice("settask:cal:".length);
+              const p = /^\d{4}-\d{2}$/.test(ym) ? await getProfileByTelegramUserId(db, from.id) : null;
+              if (!p) {
+                await handleStart(env, db, chatId, from);
+              } else {
+                const tz = p.timezone || (await getParameter(db, "default_timezone")) || "UTC";
+                const today = ymdFromDateInTimeZone(new Date(), tz);
+                const [year, month] = ym.split("-").map(Number);
+                const reply_markup = await deadlineCalendarKeyboard(db, year, month, today);
+                try {
+                  await telegramApi(env, "editMessageReplyMarkup", {
+                    chat_id: chatId,
+                    message_id: callback.message.message_id,
+                    reply_markup,
+                  });
+                } catch (e) {
+                  console.error("edit calendar failed:", e);
+                  const ask = await formatMessage(db, MessageTags.setTaskAskDeadline, {});
+                  await sendTelegramMessage(env, { chat_id: chatId, text: ask, reply_markup });
+                }
+              }
+            } else if (data.startsWith("settask:date:")) {
+              const ymd = data.slice("settask:date:".length);
+              const p = /^\d{4}-\d{2}-\d{2}$/.test(ymd) ? await getProfileByTelegramUserId(db, from.id) : null;
+              if (!p) {
+                await handleStart(env, db, chatId, from);
+              } else {
+                const stateKey = `settask_state_${from.id}`;
+                const stateRow = await dbGet(db, "SELECT parameter_value FROM parameters WHERE parameter_key=? LIMIT 1", [stateKey]);
+                const state = stateRow ? JSON.parse(stateRow.parameter_value) : {};
+                state.deadline = ymd;
+                await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
+                  .bind(stateKey, JSON.stringify(state))
+                  .run();
+                await promptSetTaskProject(env, db, chatId, from, p);
+              }
             } else if (data.startsWith("settask:priority:")) {
               const p = await getProfileByTelegramUserId(db, from.id);
-              if (!p) return;
-              const stateKey = `settask_state_${from.id}`;
-              const stateRow = await dbGet(db, "SELECT parameter_value FROM parameters WHERE parameter_key=? LIMIT 1", [stateKey]);
-              const state = stateRow ? JSON.parse(stateRow.parameter_value) : {};
-              state.priority = data.slice("settask:priority:".length);
-              await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
-                .bind(stateKey, JSON.stringify(state))
-                .run();
-              await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
-                .bind(`settask_step_${from.id}`, "project")
-                .run();
-              // Ensure projects are present for chooser
-              await ensureNotionUserIdForEmail(env, db, p);
-              await syncProjectsForUserFromNotion(env, db, p);
-              const ask = await formatMessage(db, MessageTags.setTaskAskProject, {});
-              await telegramApi(env, "sendMessage", {
-                chat_id: chatId,
-                text: ask,
-                reply_markup: await setTaskProjectKeyboard(env, db, p),
-              });
+              if (!p) await handleStart(env, db, chatId, from);
+              else await promptSetTaskProject(env, db, chatId, from, p);
             } else if (data.startsWith("settask:project:")) {
               const p = await getProfileByTelegramUserId(db, from.id);
-              if (!p) return;
-              const stateKey = `settask_state_${from.id}`;
-              const stateRow = await dbGet(db, "SELECT parameter_value FROM parameters WHERE parameter_key=? LIMIT 1", [stateKey]);
-              const state = stateRow ? JSON.parse(stateRow.parameter_value) : {};
-              const picked = data.slice("settask:project:".length);
-              state.project_id = picked === "none" ? null : picked;
-              await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
-                .bind(stateKey, JSON.stringify(state))
-                .run();
-
-              const title = String(state.title || "").trim();
-              const deadline = String(state.deadline || "").trim();
-              const priority = String(state.priority || "").trim();
-              if (!title || !deadline || !priority) {
-                await telegramApi(env, "sendMessage", { chat_id: chatId, text: "Set task flow expired. Start again from Profile settings." });
-                await env.DB.prepare("DELETE FROM parameters WHERE parameter_key IN (?,?)")
-                  .bind(`settask_step_${from.id}`, stateKey)
+              if (!p) {
+                await handleStart(env, db, chatId, from);
+              } else {
+                const stateKey = `settask_state_${from.id}`;
+                const stateRow = await dbGet(db, "SELECT parameter_value FROM parameters WHERE parameter_key=? LIMIT 1", [stateKey]);
+                const state = stateRow ? JSON.parse(stateRow.parameter_value) : {};
+                const picked = data.slice("settask:project:".length);
+                state.project_id = picked === "none" ? null : picked;
+                await env.DB.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)")
+                  .bind(stateKey, JSON.stringify(state))
                   .run();
-                return;
+
+                const title = String(state.title || "").trim();
+                const deadline = String(state.deadline || "").trim();
+                if (!title || !deadline) {
+                  await telegramApi(env, "sendMessage", { chat_id: chatId, text: "Set task flow expired. Start again from the menu." });
+                  await env.DB.prepare("DELETE FROM parameters WHERE parameter_key IN (?,?)")
+                    .bind(`settask_step_${from.id}`, stateKey)
+                    .run();
+                } else {
+                  try {
+                    const props = await buildCreateTaskProperties(env, db, p, {
+                      title,
+                      deadline,
+                      project_id: state.project_id,
+                    });
+                    await notionCreateTask(env, props);
+                    await env.DB.prepare("DELETE FROM parameters WHERE parameter_key IN (?,?)")
+                      .bind(`settask_step_${from.id}`, stateKey)
+                      .run();
+                    const ok = await formatMessage(db, MessageTags.setTaskCreated, {});
+                    await sendTelegramMessage(env, { chat_id: chatId, text: ok, reply_markup: await mainMenuKeyboard(db) });
+                  } catch (e) {
+                    console.error("buildCreateTaskProperties error:", e);
+                    await telegramApi(env, "sendMessage", {
+                      chat_id: chatId,
+                      text:
+                        "Could not create task in Notion. Make sure your work email matches your Notion account " +
+                        "and the bot integration can access Tasks + hosq projects databases.\n\n" +
+                        `Details: ${String(e)}`,
+                    });
+                  }
+                }
               }
-
-              let props;
-              try {
-                props = await buildCreateTaskProperties(env, db, p, {
-                  title,
-                  deadline,
-                  priority,
-                  project_id: state.project_id,
-                });
-              } catch (e) {
-                console.error("buildCreateTaskProperties error:", e);
-                await telegramApi(env, "sendMessage", {
-                  chat_id: chatId,
-                  text:
-                    "Could not create task in Notion. Make sure your work email matches your Notion account " +
-                    "and the bot integration can access Tasks + hosq projects databases.\n\n" +
-                    `Details: ${String(e)}`,
-                });
-                return;
-              }
-
-              await notionCreateTask(env, props);
-
-              await env.DB.prepare("DELETE FROM parameters WHERE parameter_key IN (?,?)")
-                .bind(`settask_step_${from.id}`, stateKey)
-                .run();
-              const ok = await formatMessage(db, MessageTags.setTaskCreated, {});
-              await sendTelegramMessage(env, { chat_id: chatId, text: ok, reply_markup: await mainMenuKeyboard(db) });
             } else if (data.startsWith("task:open:")) {
               await openTask(env, db, chatId, from, data.slice("task:open:".length));
             } else if (data.startsWith("task:done:")) {
