@@ -643,15 +643,189 @@ async function mainMenuKeyboard(db) {
 
 async function settingsKeyboard(db) {
   const change = await formatMessage(db, MessageTags.settingsChangeEmail, {});
-  const restart = await formatMessage(db, MessageTags.settingsRestart, {});
   const back = await formatMessage(db, MessageTags.menuNavMenu, {});
   return {
     inline_keyboard: [
       [{ text: change, callback_data: "settings:email" }],
-      [{ text: restart, callback_data: "settings:restart" }],
+      [{ text: "✦ restart ✦", callback_data: "settings:restart" }],
+      [{ text: "check partnership requests →", callback_data: "settings:partnerships" }],
       [{ text: back, callback_data: "menu:back" }],
     ],
   };
+}
+
+const PARTNERSHIP_SHEET_ID = "1BTCtTXZ5cc21E2EPGhPLb5Lj4ixP0OVKDCFKoZZMbjY";
+const PARTNERSHIP_SHEET_URL = `https://docs.google.com/spreadsheets/d/${PARTNERSHIP_SHEET_ID}/edit`;
+const PARTNERSHIP_NOTIFY_EMAILS = [
+  ["upyadushkina@gmail.com", "uliana@hosq.co"],
+  ["ovchinnikovasonya@gmail.com", "sonya@hosq.co"],
+];
+
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let inQuotes = false;
+  const src = String(text || "");
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (src[i + 1] === '"') {
+          cell += '"';
+          i++;
+        } else inQuotes = false;
+      } else cell += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (c === "\n") {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else if (c !== "\r") cell += c;
+  }
+  if (cell.length || row.length) {
+    row.push(cell);
+    rows.push(row);
+  }
+  return rows.filter((r) => r.some((c) => String(c || "").trim()));
+}
+
+function csvHeaderIndex(headers, test) {
+  return headers.findIndex((h) => test(normalizeKey(String(h || "")).replace(/[\s_]+/g, " ")));
+}
+
+async function fetchPartnershipRequests() {
+  const res = await fetch(`https://docs.google.com/spreadsheets/d/${PARTNERSHIP_SHEET_ID}/export?format=csv`);
+  if (!res.ok) throw new Error(`Partnership sheet failed ${res.status}`);
+  const rows = parseCsv(await res.text());
+  if (!rows.length) return [];
+  const headers = rows[0];
+  const nameI = csvHeaderIndex(headers, (h) => h.includes("name of the applicant"));
+  const orgI = csvHeaderIndex(headers, (h) => h === "organization" || h.startsWith("organization "));
+  const webI = csvHeaderIndex(headers, (h) => h.includes("website or portfolio"));
+  const kindI = csvHeaderIndex(headers, (h) => h.includes("what kind of partnership"));
+  const tokenI = csvHeaderIndex(headers, (h) => h === "token");
+  const atI = csvHeaderIndex(headers, (h) => h.includes("submitted at"));
+  return rows.slice(1).map((cols) => {
+    const name = String((nameI >= 0 && cols[nameI]) || "").trim();
+    const org = String((orgI >= 0 && cols[orgI]) || "").trim();
+    const website = String((webI >= 0 && cols[webI]) || "").trim();
+    const kind = String((kindI >= 0 && cols[kindI]) || "").trim();
+    const token = String((tokenI >= 0 && cols[tokenI]) || "").trim();
+    const submittedAt = String((atI >= 0 && cols[atI]) || "").trim();
+    const id = token || `${submittedAt}|${name}|${org}`;
+    return { id, name, org, website, kind, submittedAt };
+  }).filter((row) => row.id && (row.name || row.org));
+}
+
+async function setParameter(db, key, value) {
+  await db.prepare("INSERT OR REPLACE INTO parameters(parameter_key, parameter_value) VALUES(?,?)").bind(key, String(value)).run();
+}
+
+async function loadSeenPartnershipIds(db) {
+  const raw = await getParameter(db, "partnership_seen_ids");
+  if (!raw) return new Set();
+  try {
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr.map(String) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+async function saveSeenPartnershipIds(db, ids) {
+  await setParameter(db, "partnership_seen_ids", JSON.stringify(Array.from(ids)));
+}
+
+async function partnershipRecipientChatIds(db) {
+  const ids = [];
+  for (const emails of PARTNERSHIP_NOTIFY_EMAILS) {
+    for (const email of emails) {
+      const profile = await getProfileByEmail(db, email);
+      if (profile && profile.telegram_user_id) {
+        ids.push(String(profile.telegram_user_id));
+        break;
+      }
+    }
+  }
+  return Array.from(new Set(ids));
+}
+
+function partnershipNoticeText(row) {
+  const who = `${escapeHtml(row.name || "—")} | ${escapeHtml(row.org || "—")}`;
+  const web = String(row.website || "").trim();
+  const site = /^https?:\/\//i.test(web) ? `<a href="${escapeHtml(web)}">Website or Portfolio</a>` : escapeHtml(web);
+  const lines = [`<b>new partnership request</b>:`, who];
+  if (site) lines.push(site);
+  lines.push("");
+  lines.push("What kind of partnership:");
+  lines.push(escapeHtml(row.kind || "—"));
+  return lines.join("\n");
+}
+
+async function notifyPartnershipRequest(env, chatIds, row) {
+  const text = partnershipNoticeText(row);
+  const reply_markup = { inline_keyboard: [[{ text: "✦ Open Google Sheet", url: PARTNERSHIP_SHEET_URL }]] };
+  for (const chatId of chatIds) {
+    await sendTelegramMessage(env, { chat_id: chatId, text, reply_markup, parse_mode: "HTML" });
+  }
+}
+
+function formatPartnershipCheckedAt(iso) {
+  if (!iso) return "not yet";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "not yet";
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Yerevan",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(d);
+}
+
+async function checkPartnershipRequests(env, db, replyChatId) {
+  const rows = await fetchPartnershipRequests();
+  const ready = await getParameter(db, "partnership_seen_ready");
+  const seen = await loadSeenPartnershipIds(db);
+  if (!ready) {
+    for (const row of rows) seen.add(row.id);
+    await saveSeenPartnershipIds(db, seen);
+    await setParameter(db, "partnership_seen_ready", "1");
+    await setParameter(db, "partnership_last_check", new Date().toISOString());
+    if (replyChatId) {
+      await sendTelegramMessage(env, {
+        chat_id: replyChatId,
+        text: `checked the sheet. ${rows.length} request${rows.length === 1 ? "" : "s"} already there — i'll message you when a new one arrives.`,
+      });
+    }
+    return { bootstrapped: true, fresh: 0 };
+  }
+  const fresh = rows.filter((row) => !seen.has(row.id));
+  const recipients = fresh.length ? await partnershipRecipientChatIds(db) : [];
+  let sent = 0;
+  for (const row of fresh) {
+    if (!recipients.length) break;
+    await notifyPartnershipRequest(env, recipients, row);
+    seen.add(row.id);
+    sent += 1;
+  }
+  if (sent) await saveSeenPartnershipIds(db, seen);
+  await setParameter(db, "partnership_last_check", new Date().toISOString());
+  if (replyChatId) {
+    const text = !fresh.length
+      ? "checked. no new requests."
+      : recipients.length
+        ? `checked. ${sent} new request${sent === 1 ? "" : "s"}.`
+        : "checked. new requests are in the sheet, but Uliana and Sonya are not registered in the bot yet.";
+    await sendTelegramMessage(env, { chat_id: replyChatId, text });
+  }
+  return { bootstrapped: false, fresh: sent };
 }
 
 async function clearSettingsStep(db, telegramUserId) {
@@ -661,11 +835,21 @@ async function clearSettingsStep(db, telegramUserId) {
 async function showSettings(env, db, chatId, from) {
   const p = await getProfileByTelegramUserId(db, from.id);
   if (!p) return handleStart(env, db, chatId, from);
-  const text = await formatMessage(db, MessageTags.settingsMenu, { email: p.user_email });
+  const checked = formatPartnershipCheckedAt(await getParameter(db, "partnership_last_check"));
+  const text = [
+    "<b>settings</b>",
+    "",
+    `your current email · ${escapeHtml(p.user_email)}`,
+    "tasks are matched to this address",
+    "",
+    `✦ bot is connected to <a href="${escapeHtml(PARTNERSHIP_SHEET_URL)}">Partnership Requests Sheet</a>`,
+    `last update: ${escapeHtml(checked)}`,
+  ].join("\n");
   await sendTelegramMessage(env, {
     chat_id: chatId,
     text,
     reply_markup: await settingsKeyboard(db),
+    parse_mode: "HTML",
   });
 }
 
@@ -1291,6 +1475,29 @@ function isPastProject(project, today) {
 
 function hasProjectDate(project, today) {
   return Boolean(ymdOrEmpty(project.start, today) || ymdOrEmpty(project.end, today));
+}
+
+const ALL_PROJECTS_ACTIVE_STATUSES = new Set(["preparing", "in progress", "reviewing"]);
+const ALL_PROJECTS_PAST_STATUSES = new Set(["completed"]);
+
+function projectStatusKey(project) {
+  return normalizeKey(project.status);
+}
+
+function daysFromToday(ymd, today) {
+  if (!ymd || !today) return 99999;
+  const [ya, ma, da] = ymd.split("-").map(Number);
+  const [yb, mb, db] = today.split("-").map(Number);
+  const a = Date.UTC(ya, ma - 1, da);
+  const b = Date.UTC(yb, mb - 1, db);
+  return Math.abs(Math.round((a - b) / 86400000));
+}
+
+function compareByStartClosestToToday(a, b, today) {
+  const da = daysFromToday(ymdOrEmpty(a.start, today) || ymdOrEmpty(a.end, today), today);
+  const db = daysFromToday(ymdOrEmpty(b.start, today) || ymdOrEmpty(b.end, today), today);
+  if (da !== db) return da - db;
+  return String(a.name || "").localeCompare(String(b.name || ""));
 }
 
 function compareCurrentProjects(a, b, today) {
@@ -2102,8 +2309,10 @@ async function showAllProjects(env, db, chatId, from) {
     return;
   }
   const dated = projects.filter((project) => hasProjectDate(project, today));
-  const current = dated.filter((project) => !isPastProject(project, today)).sort((a, b) => compareCurrentProjects(a, b, today));
-  const past = dated.filter((project) => isPastProject(project, today));
+  const current = dated
+    .filter((project) => ALL_PROJECTS_ACTIVE_STATUSES.has(projectStatusKey(project)))
+    .sort((a, b) => compareByStartClosestToToday(a, b, today));
+  const past = dated.filter((project) => ALL_PROJECTS_PAST_STATUSES.has(projectStatusKey(project)));
   const emptyText = await formatMessage(db, MessageTags.projectsEmpty, {});
   if (!current.length && !past.length) {
     await sendTelegramMessage(env, { chat_id: chatId, text: emptyText, reply_markup: await mainMenuKeyboard(db) });
@@ -2137,8 +2346,8 @@ async function showAllPastProjects(env, db, chatId, from) {
     return;
   }
   const past = projects
-    .filter((project) => hasProjectDate(project, today) && isPastProject(project, today))
-    .sort((a, b) => comparePastProjects(a, b, today));
+    .filter((project) => hasProjectDate(project, today) && ALL_PROJECTS_PAST_STATUSES.has(projectStatusKey(project)))
+    .sort((a, b) => compareByStartClosestToToday(a, b, today));
   const header = await formatMessage(db, MessageTags.projectsPastHeader, {});
   const emptyText = await formatMessage(db, MessageTags.projectsEmpty, {});
   await sendProjectList(env, db, chatId, past, {
@@ -2854,6 +3063,10 @@ export default {
             else if (data === "menu:settings") await showSettings(env, db, chatId, from);
             else if (data === "settings:email") await startChangeEmail(env, db, chatId, from);
             else if (data === "settings:restart") await restartRegistration(env, db, chatId, from);
+            else if (data === "settings:partnerships") {
+              await checkPartnershipRequests(env, db, chatId);
+              await showSettings(env, db, chatId, from);
+            }
             else if (data === "menu:back") {
               await clearSettingsStep(db, from.id);
               const menu = await formatMessage(db, MessageTags.menuMain, {});
@@ -2988,6 +3201,15 @@ export default {
     }
 
     return new Response("not found", { status: 404 });
+  },
+
+  async scheduled(event, env, ctx) {
+    if (!env.DB) return;
+    ctx.waitUntil(
+      checkPartnershipRequests(env, env.DB, null).catch((e) => {
+        console.error("partnership daily check failed:", e);
+      }),
+    );
   },
 };
 
