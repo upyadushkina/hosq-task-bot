@@ -18,6 +18,10 @@ const MessageTags = {
   menuMain: "menu_main",
   menuTasks: "menu_tasks",
   menuProjects: "menu_projects",
+  menuAllProjects: "menu_all_projects",
+  menuPastProjects: "menu_past_projects",
+  projectsPastHeader: "projects_past_header",
+  projectsAllHeader: "projects_all_header",
   menuOnFire: "menu_on_fire",
   menuNewTask: "menu_new_task",
   menuSettings: "menu_settings",
@@ -64,6 +68,10 @@ const DEFAULT_MESSAGES = {
   menu_on_fire: "on fire 🔥",
   menu_tasks: "my tasks",
   menu_projects: "my projects",
+  menu_all_projects: "all projects",
+  menu_past_projects: "past projects",
+  projects_past_header: "past projects",
+  projects_all_header: "all projects",
   menu_new_task: "new task",
   menu_settings: "settings",
   settings_menu: "settings\n\ncurrent email · {email}\n\ntasks are matched to this address",
@@ -86,7 +94,7 @@ const DEFAULT_MESSAGES = {
   projects_list_header: "your projects ↓",
   projects_empty: "no projects found",
   task_card_template:
-    "<b>{title}</b>\n\ndue {deadline}\n\nproject · {project}\npriority · {priority}\nstatus · {status}\nconsult · {consult_name} {consult_username}\n\n{categories}\n\n{description}",
+    "<b>{title}</b>\n\ndue {deadline}\n\nproject · {project}\npriority · {priority}\nconsult · {consult_name} {consult_username}\n\n{categories}\n\n{description}",
   task_action_complete: "✓ Done",
   task_action_open_notion: "✦ Open in Notion",
   task_done_success: "✦ marked as done, nice job",
@@ -617,16 +625,16 @@ function getCommandLikeText(message) {
 }
 
 async function mainMenuKeyboard(db) {
-  const tOnFire = await formatMessage(db, MessageTags.menuOnFire, {});
   const tTasks = await formatMessage(db, MessageTags.menuTasks, {});
   const tProjects = await formatMessage(db, MessageTags.menuProjects, {});
+  const tAllProjects = await formatMessage(db, MessageTags.menuAllProjects, {});
   const tNewTask = await formatMessage(db, MessageTags.menuNewTask, {});
   const tSettings = await formatMessage(db, MessageTags.menuSettings, {});
   return {
     inline_keyboard: [
-      [{ text: tOnFire, callback_data: "menu:onfire" }],
       [{ text: tTasks, callback_data: "menu:tasks" }],
       [{ text: tProjects, callback_data: "menu:projects" }],
+      [{ text: tAllProjects, callback_data: "menu:allprojects" }],
       [{ text: tNewTask, callback_data: "menu:newtask" }],
       [{ text: tSettings, callback_data: "menu:settings" }],
     ],
@@ -1244,7 +1252,106 @@ function findProjectOwnerPropertyKey(schemaProps) {
 
 function projectStatusFromProps(props) {
   const prop = pickFirstPropByNames(props, ["Status", "Project status", "status"]);
-  return statusOrSelectName(prop || {}) || "active";
+  return statusOrSelectName(prop || {}) || "";
+}
+
+function projectDateRange(props) {
+  const dates = [];
+  for (const key of Object.keys(props || {})) {
+    const prop = props[key];
+    if (!prop || !(prop.type === "date" || (prop.date && (prop.date.start || prop.date.end)))) continue;
+    dates.push({
+      key,
+      start: (prop.date && prop.date.start) || "",
+      end: (prop.date && prop.date.end) || "",
+    });
+  }
+  const ranged = dates.find((d) => d.start && d.end);
+  if (ranged) return { start: ranged.start, end: ranged.end };
+  const startNamed = dates.find((d) => /start|from|begin/i.test(d.key));
+  const endNamed = dates.find((d) => /end|finish|until|to\b/i.test(d.key));
+  if (startNamed || endNamed) {
+    return {
+      start: startNamed ? startNamed.start : "",
+      end: endNamed ? endNamed.start || endNamed.end : "",
+    };
+  }
+  if (dates.length === 1) return { start: dates[0].start, end: dates[0].end };
+  return { start: "", end: "" };
+}
+
+function ymdOrEmpty(raw, today) {
+  return parseLooseDeadlineToYmd(raw, today) || "";
+}
+
+function isPastProject(project, today) {
+  const end = ymdOrEmpty(project.end, today);
+  return Boolean(end && end < today);
+}
+
+function compareCurrentProjects(a, b, today) {
+  const rank = (project) => {
+    const end = ymdOrEmpty(project.end, today);
+    const start = ymdOrEmpty(project.start, today);
+    if (end && end >= today) return end;
+    if (start && start >= today) return start;
+    if (start) return `9998-${start}`;
+    return "9999";
+  };
+  const ka = rank(a);
+  const kb = rank(b);
+  if (ka !== kb) return ka < kb ? -1 : 1;
+  return String(a.name || "").localeCompare(String(b.name || ""));
+}
+
+function comparePastProjects(a, b, today) {
+  const ea = ymdOrEmpty(a.end, today);
+  const eb = ymdOrEmpty(b.end, today);
+  if (ea !== eb) return eb < ea ? -1 : 1;
+  return String(a.name || "").localeCompare(String(b.name || ""));
+}
+
+function formatProjectDatesLine(startRaw, endRaw, today) {
+  const start = ymdOrEmpty(startRaw, today);
+  const end = ymdOrEmpty(endRaw, today);
+  const a = start ? formatDeadlineShort(start, today) : "";
+  const b = end ? formatDeadlineShort(end, today) : "";
+  if (a && b && a !== b) return `${a} – ${b}`;
+  return a || b || "";
+}
+
+function projectGalleryLabel(project, today) {
+  const dates = formatProjectDatesLine(project.start, project.end, today);
+  const name = String(project.name || "project");
+  if (!dates) return name.slice(0, 60);
+  const suffix = ` | ${dates}`;
+  const room = Math.max(8, 60 - suffix.length);
+  return `${name.slice(0, room)}${suffix}`.slice(0, 60);
+}
+
+function propPlain(prop) {
+  if (!prop) return "";
+  const named = statusOrSelectName(prop);
+  if (named) return named;
+  const multi = multiSelectNames(prop);
+  if (multi.length) return multi.join(", ");
+  const rich = firstTextFromRichText(prop);
+  if (rich) return rich;
+  return textValue(prop);
+}
+
+function peopleLabel(prop) {
+  const arr = prop && prop.people ? prop.people : [];
+  const names = arr.map((p) => (p && (p.name || (p.person && p.person.email))) || "").filter(Boolean);
+  if (names.length) return names.join(", ");
+  return emailValue(prop);
+}
+
+function findNamedProp(props, pattern) {
+  for (const key of Object.keys(props || {})) {
+    if (pattern.test(key)) return props[key];
+  }
+  return null;
 }
 
 function pageOwnedByProfile(page, ownerKey, ownerType, profile) {
@@ -1302,16 +1409,52 @@ async function listOwnedNotionProjects(env, profile) {
       const props = page.properties || {};
       const fromTitle = titleKey && props[titleKey] ? firstTextFromTitle(props[titleKey]) : "";
       const name = fromTitle || firstTitleFromAnyProperty(props) || "untitled";
+      const range = projectDateRange(props);
       return {
         id: String(page.id),
         name,
         status: projectStatusFromProps(props),
+        start: range.start,
+        end: range.end,
+      };
+    });
+}
+
+async function listAllNotionProjects(env) {
+  const dbId = projectsDatabaseId(env);
+  const schema = await notionFetch(env, `/databases/${dbId}`, { method: "GET" });
+  const schemaProps = schema.properties || {};
+  const titleKey = findTitlePropertyKey(schemaProps, null);
+  const pages = [];
+  let cursor = null;
+  do {
+    const body = { page_size: 100 };
+    if (cursor) body.start_cursor = cursor;
+    const res = await notionQueryProjectsDatabase(env, body);
+    pages.push(...(res.results || []));
+    cursor = res.has_more ? res.next_cursor : null;
+  } while (cursor && pages.length < 300);
+
+  return pages
+    .filter((page) => page && page.object !== "database" && !page.archived)
+    .map((page) => {
+      const props = page.properties || {};
+      const fromTitle = titleKey && props[titleKey] ? firstTextFromTitle(props[titleKey]) : "";
+      const range = projectDateRange(props);
+      return {
+        id: String(page.id),
+        name: fromTitle || firstTitleFromAnyProperty(props) || "untitled",
+        status: projectStatusFromProps(props),
+        start: range.start,
+        end: range.end,
       };
     });
 }
 
 async function syncProjectsForUserFromNotion(env, db, profile) {
-  const projects = await listOwnedNotionProjects(env, profile);
+  const tz = profile.timezone || "UTC";
+  const today = ymdFromDateInTimeZone(new Date(), tz);
+  const projects = (await listOwnedNotionProjects(env, profile)).filter((project) => !isPastProject(project, today));
   await db.prepare("DELETE FROM projects WHERE lower(project_owner_email)=?").bind(normalizeKey(profile.user_email)).run();
   for (const project of projects) {
     await db
@@ -1323,49 +1466,123 @@ async function syncProjectsForUserFromNotion(env, db, profile) {
   }
 }
 
-async function showProjectTasks(env, db, chatId, from, projectId) {
+function findTaskProjectRelationKey(schemaProps, env) {
+  const wanted = projectsDatabaseId(env).replace(/-/g, "");
+  let named = null;
+  for (const key of Object.keys(schemaProps || {})) {
+    const prop = schemaProps[key];
+    if (!prop || prop.type !== "relation") continue;
+    const db = String((prop.relation && prop.relation.database_id) || "").replace(/-/g, "").toLowerCase();
+    if (db && db === wanted) return key;
+    if (/project/i.test(key) && !named) named = key;
+  }
+  return named;
+}
+
+async function listTasksForProject(env, projectId) {
+  const schema = await notionGetDatabaseSchema(env);
+  const relKey = findTaskProjectRelationKey(schema.properties || {}, env);
+  if (!relKey) return [];
+  const pages = [];
+  let cursor = null;
+  const id = notionId(projectId);
+  do {
+    const body = {
+      page_size: 100,
+      filter: { property: relKey, relation: { contains: id } },
+    };
+    if (cursor) body.start_cursor = cursor;
+    const res = await notionQueryDatabase(env, body);
+    pages.push(...(res.results || []));
+    cursor = res.has_more ? res.next_cursor : null;
+  } while (cursor && pages.length < 80);
+  return pages.filter((page) => page && page.object === "page" && !page.archived);
+}
+
+function projectCardText(page, today) {
+  const props = (page && page.properties) || {};
+  const name = firstTitleFromAnyProperty(props) || "untitled";
+  const range = projectDateRange(props);
+  const dates = formatProjectDatesLine(range.start, range.end, today);
+  const ownerProp = findNamedProp(props, /project owner|^owner$/i) || pickFirstPropByNames(props, ["Project owner", "Project Owner", "Owner"]);
+  const owner = peopleLabel(ownerProp || {});
+  const stream = propPlain(findNamedProp(props, /stream/i) || {});
+  const status = projectStatusFromProps(props);
+  const description = propPlain(pickFirstPropByNames(props, ["Description", "description"]) || {}).slice(0, 3000);
+
+  const lines = [name];
+  if (dates) lines.push(dates);
+  if (owner) lines.push(owner);
+  if (stream || status) lines.push("");
+  if (stream) lines.push(stream);
+  if (status) lines.push(status);
+  if (description) {
+    lines.push("");
+    lines.push(description);
+  }
+  return lines.join("\n");
+}
+
+async function showProjectCard(env, db, chatId, from, projectId, backCallback) {
   const p = await getProfileByTelegramUserId(db, from.id);
   if (!p) return handleStart(env, db, chatId, from);
-  await ensureNotionUserIdForEmail(env, db, p);
-  await setTaskListBack(db, from.id, "menu:projects");
-
+  const kind = backCallback === "menu:allprojects" ? "a" : backCallback === "projects:past" ? "p" : "m";
+  await setTaskListBack(db, from.id, `popen:${kind}:${notionId(projectId)}`);
   const tz = p.timezone || (await getParameter(db, "default_timezone")) || "UTC";
   const today = ymdFromDateInTimeZone(new Date(), tz);
 
-  const project = await dbGet(db, "SELECT project_name FROM projects WHERE project_tag=? LIMIT 1", [String(projectId)]);
-  const projectName = project ? project.project_name : String(projectId);
-
-  let tasks = [];
+  let page;
   try {
-    tasks = await collectActiveNotionTasksForProfile(env, p, 400);
+    page = await notionFetch(env, `/pages/${notionId(projectId)}`, { method: "GET" });
   } catch (e) {
-    console.error("showProjectTasks notion error:", e);
+    console.error("showProjectCard page error:", e);
     await sendTelegramMessage(env, { chat_id: chatId, text: String(e), reply_markup: await mainMenuKeyboard(db) });
     return;
   }
 
-  const related = tasks.filter((t) => connectedProjectRelationIdsFromTask(t).includes(String(projectId)));
-  if (!related.length) {
-    await sendTelegramMessage(env, {
-      chat_id: chatId,
-      text: `${projectName}\n\nNo tasks in this project.`,
-      reply_markup: {
-        inline_keyboard: [[{ text: await formatMessage(db, MessageTags.menuBack, {}), callback_data: "menu:projects" }]],
-      },
-    });
-    return;
+  let tasks = [];
+  try {
+    tasks = await listTasksForProject(env, projectId);
+  } catch (e) {
+    console.error("showProjectCard tasks error:", e);
   }
+  tasks.sort((a, b) => {
+    const da = parseLooseDeadlineToYmd(deadlineFromProps(a.properties || {}, env), today) || "9999-99-99";
+    const db_ = parseLooseDeadlineToYmd(deadlineFromProps(b.properties || {}, env), today) || "9999-99-99";
+    return String(da).localeCompare(String(db_));
+  });
 
-  const nav = await listNavKeyboard(db, "menu:projects");
+  const nav = await listNavKeyboard(db, backCallback);
   const keyboard = {
     inline_keyboard: [
-      ...related.map((page) => [
-        { text: taskGalleryLabel(page, env, today), callback_data: `task:open:${page.id}` },
+      ...tasks.slice(0, 30).map((task) => [
+        { text: taskGalleryLabel(task, env, today), callback_data: `task:open:${task.id}` },
       ]),
       ...nav.inline_keyboard,
     ],
   };
-  await sendTelegramMessage(env, { chat_id: chatId, text: projectName, reply_markup: keyboard });
+  await sendTelegramMessage(env, { chat_id: chatId, text: projectCardText(page, today), reply_markup: keyboard });
+}
+
+async function sendProjectList(env, db, chatId, projects, { header, today, kind, extraButtons, backCallback, emptyText }) {
+  if (!projects.length && !(extraButtons && extraButtons.length)) {
+    await sendTelegramMessage(env, { chat_id: chatId, text: emptyText, reply_markup: await mainMenuKeyboard(db) });
+    return;
+  }
+  const nav = await listNavKeyboard(db, backCallback);
+  await sendTelegramMessage(env, {
+    chat_id: chatId,
+    text: header,
+    reply_markup: {
+      inline_keyboard: [
+        ...projects.slice(0, 30).map((project) => [
+          { text: projectGalleryLabel(project, today), callback_data: `popen:${kind}:${notionId(project.id)}` },
+        ]),
+        ...(extraButtons || []),
+        ...nav.inline_keyboard,
+      ],
+    },
+  });
 }
 
 async function notionQueryDatabase(env, body) {
@@ -1758,15 +1975,31 @@ async function showProfile(env, db, chatId, from) {
   await sendProfileCard(env, db, chatId, p, keyboard);
 }
 
+async function loadOwnedProjects(env, db, profile) {
+  await ensureNotionUserIdForEmail(env, db, profile);
+  const projects = await listOwnedNotionProjects(env, profile);
+  const tz = profile.timezone || (await getParameter(db, "default_timezone")) || "UTC";
+  const today = ymdFromDateInTimeZone(new Date(), tz);
+  const current = projects.filter((project) => !isPastProject(project, today)).sort((a, b) => compareCurrentProjects(a, b, today));
+  const past = projects.filter((project) => isPastProject(project, today)).sort((a, b) => comparePastProjects(a, b, today));
+  await db.prepare("DELETE FROM projects WHERE lower(project_owner_email)=?").bind(normalizeKey(profile.user_email)).run();
+  for (const project of current) {
+    await db
+      .prepare(
+        "INSERT OR REPLACE INTO projects(project_tag, project_name, project_owner_email, project_status) VALUES(?,?,?,?)",
+      )
+      .bind(project.id, project.name, profile.user_email, project.status || "active")
+      .run();
+  }
+  return { current, past, today };
+}
+
 async function showProjects(env, db, chatId, from) {
   const p = await getProfileByTelegramUserId(db, from.id);
-  if (!p) {
-    await handleStart(env, db, chatId, from);
-    return;
-  }
-  await ensureNotionUserIdForEmail(env, db, p);
+  if (!p) return handleStart(env, db, chatId, from);
+  let split;
   try {
-    await syncProjectsForUserFromNotion(env, db, p);
+    split = await loadOwnedProjects(env, db, p);
   } catch (e) {
     console.error("showProjects notion error:", e);
     await sendTelegramMessage(env, {
@@ -1778,29 +2011,75 @@ async function showProjects(env, db, chatId, from) {
     });
     return;
   }
-  const projects = await dbAll(
-    db,
-    "SELECT project_tag, project_name, project_status FROM projects WHERE lower(project_owner_email)=? ORDER BY project_name",
-    [normalizeKey(p.user_email)],
-  );
-  if (!projects.length) {
-    const t = await formatMessage(db, MessageTags.projectsEmpty, { email: p.user_email });
-    await sendTelegramMessage(env, { chat_id: chatId, text: t, reply_markup: await mainMenuKeyboard(db) });
+  const emptyText = await formatMessage(db, MessageTags.projectsEmpty, { email: p.user_email });
+  if (!split.current.length && !split.past.length) {
+    await sendTelegramMessage(env, { chat_id: chatId, text: emptyText, reply_markup: await mainMenuKeyboard(db) });
     return;
   }
+  const pastBtn = split.past.length
+    ? [[{ text: await formatMessage(db, MessageTags.menuPastProjects, {}), callback_data: "projects:past" }]]
+    : [];
   const header = await formatMessage(db, MessageTags.projectsListHeader, {});
-  const nav = await listNavKeyboard(db, "menu:back");
-  await sendTelegramMessage(env, {
-    chat_id: chatId,
-    text: header,
-    reply_markup: {
-      inline_keyboard: [
-        ...projects.map((x) => [
-          { text: String(x.project_name || "project").slice(0, 60), callback_data: `project:open:${x.project_tag}` },
-        ]),
-        ...nav.inline_keyboard,
-      ],
-    },
+  await sendProjectList(env, db, chatId, split.current, {
+    header,
+    today: split.today,
+    kind: "m",
+    extraButtons: pastBtn,
+    backCallback: "menu:back",
+    emptyText,
+  });
+}
+
+async function showPastProjects(env, db, chatId, from) {
+  const p = await getProfileByTelegramUserId(db, from.id);
+  if (!p) return handleStart(env, db, chatId, from);
+  let split;
+  try {
+    split = await loadOwnedProjects(env, db, p);
+  } catch (e) {
+    console.error("showPastProjects notion error:", e);
+    await sendTelegramMessage(env, { chat_id: chatId, text: String(e), reply_markup: await mainMenuKeyboard(db) });
+    return;
+  }
+  const header = await formatMessage(db, MessageTags.projectsPastHeader, {});
+  const emptyText = await formatMessage(db, MessageTags.projectsEmpty, { email: p.user_email });
+  await sendProjectList(env, db, chatId, split.past, {
+    header,
+    today: split.today,
+    kind: "p",
+    backCallback: "menu:projects",
+    emptyText,
+  });
+}
+
+async function showAllProjects(env, db, chatId, from) {
+  const p = await getProfileByTelegramUserId(db, from.id);
+  if (!p) return handleStart(env, db, chatId, from);
+  const tz = p.timezone || (await getParameter(db, "default_timezone")) || "UTC";
+  const today = ymdFromDateInTimeZone(new Date(), tz);
+  let projects = [];
+  try {
+    projects = await listAllNotionProjects(env);
+  } catch (e) {
+    console.error("showAllProjects notion error:", e);
+    await sendTelegramMessage(env, {
+      chat_id: chatId,
+      text:
+        "Could not load projects from Notion. Invite the bot integration to the projects database.\n\n" +
+        `Details: ${String(e)}`,
+      reply_markup: await mainMenuKeyboard(db),
+    });
+    return;
+  }
+  const current = projects.filter((project) => !isPastProject(project, today)).sort((a, b) => compareCurrentProjects(a, b, today));
+  const header = await formatMessage(db, MessageTags.projectsAllHeader, {});
+  const emptyText = await formatMessage(db, MessageTags.projectsEmpty, {});
+  await sendProjectList(env, db, chatId, current, {
+    header,
+    today,
+    kind: "a",
+    backCallback: "menu:back",
+    emptyText,
   });
 }
 
@@ -1894,17 +2173,21 @@ async function renderTaskCard(env, db, page) {
 
   const consult = await consultDisplayFromProps(db, props, env, today);
 
-  return await formatMessage(db, MessageTags.taskCardTemplate, {
+  const text = await formatMessage(db, MessageTags.taskCardTemplate, {
     title,
     deadline,
     project,
     priority,
-    status,
+    status: "",
     categories: categoryLine,
     description,
     consult_name: escapeHtml(consult.name),
     consult_username: consult.username ? escapeHtml(consult.username) : "",
   });
+  return text
+    .replace(/(^|\n)[ \t]*status\s*·[^\n]*/gi, "$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 async function openTaskReadonly(env, db, chatId, pageId, backCb) {
@@ -2042,6 +2325,7 @@ async function showTeamMemberProjectTasks(env, db, chatId, from, targetTelegramU
 async function openTask(env, db, chatId, from, pageId) {
   const p = await getProfileByTelegramUserId(db, from.id);
   if (!p) return handleStart(env, db, chatId, from);
+  await ensureNotionUserIdForEmail(env, db, p);
   const page = await notionGetTask(env, pageId);
   if (!page) {
     const t = await formatMessage(db, MessageTags.taskNotFound, {});
@@ -2053,21 +2337,30 @@ async function openTask(env, db, chatId, from, pageId) {
   const btnNotion = await formatMessage(db, MessageTags.taskActionOpenNotion, {});
   const btnBack = await formatMessage(db, MessageTags.menuBack, {});
   const listBack = await getTaskListBack(db, from.id);
-  const keyboard = {
-    inline_keyboard: [
-      [{ text: btnComplete, callback_data: `task:done:${pageId}` }],
-      [{ text: btnNotion, url: notionPageUrl(pageId) }],
-      [{ text: btnBack, callback_data: listBack }],
-    ],
-  };
-  await sendTelegramMessage(env, { chat_id: chatId, text, reply_markup: keyboard, parse_mode: "HTML" });
+  const rows = [];
+  if (isResponsibleForTask(page, p, env)) {
+    rows.push([{ text: btnComplete, callback_data: `task:done:${pageId}` }]);
+  }
+  rows.push([{ text: btnNotion, url: notionPageUrl(pageId) }]);
+  rows.push([{ text: btnBack, callback_data: listBack }]);
+  await sendTelegramMessage(env, {
+    chat_id: chatId,
+    text,
+    reply_markup: { inline_keyboard: rows },
+    parse_mode: "HTML",
+  });
 }
 
 async function completeTask(env, db, chatId, from, pageId) {
   const p = await getProfileByTelegramUserId(db, from.id);
   if (!p) return handleStart(env, db, chatId, from);
+  await ensureNotionUserIdForEmail(env, db, p);
   const page = await notionGetTask(env, pageId);
   if (!page) return;
+  if (!isResponsibleForTask(page, p, env)) {
+    await openTask(env, db, chatId, from, pageId);
+    return;
+  }
   const props = page.properties || {};
   const before = normalizeKey(statusFromProps(props, env));
   const alreadyDone = before === normalizeKey("Done");
@@ -2484,6 +2777,8 @@ export default {
             if (data === "menu:tasks") await showTasks(env, db, chatId, from);
             else if (data === "menu:onfire") await showOnFire(env, db, chatId, from);
             else if (data === "menu:projects") await showProjects(env, db, chatId, from);
+            else if (data === "projects:past") await showPastProjects(env, db, chatId, from);
+            else if (data === "menu:allprojects") await showAllProjects(env, db, chatId, from);
             else if (data === "menu:newtask") await startSetTaskFlow(env, db, chatId, from);
             else if (data === "menu:settings") await showSettings(env, db, chatId, from);
             else if (data === "settings:email") await startChangeEmail(env, db, chatId, from);
@@ -2496,8 +2791,14 @@ export default {
                 text: menu,
                 reply_markup: await mainMenuKeyboard(db),
               });
+            } else if (data.startsWith("popen:")) {
+              const rest = data.slice("popen:".length);
+              const kind = rest.slice(0, 1);
+              const id = rest.slice(2);
+              const back = kind === "a" ? "menu:allprojects" : kind === "p" ? "projects:past" : "menu:projects";
+              await showProjectCard(env, db, chatId, from, id, back);
             } else if (data.startsWith("project:open:")) {
-              await showProjectTasks(env, db, chatId, from, data.slice("project:open:".length));
+              await showProjectCard(env, db, chatId, from, data.slice("project:open:".length), "menu:projects");
             } else if (data === "settask:cal:noop") {
               // weekday labels and empty calendar cells
             } else if (data.startsWith("settask:cal:")) {
